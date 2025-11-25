@@ -140,7 +140,7 @@ async function findCoverStrategically(isbn) {
 
   // --- 6. SON ÇARE: Google Books Thumbnail (Küçük ama %100 Doğru) ---
   console.log("⚠️ Hiçbir kaynakta HD bulunamadı, Google Books thumbnail dönülüyor.");
-  return `https://books.google.com/books/content?vid=ISBN${isbn}&printsec=frontcover&img=1&zoom=1&source=gbs_api`;
+  return `https://cdn.vectorstock.com/i/500p/33/47/no-photo-available-icon-vector-40343347.jpg`;
 }
 
 // ----------------------------------------------------------------
@@ -195,7 +195,12 @@ const server = http.createServer((req, res) => {
                     type: "message",
                     role: "system",
                     content: [{ type: "input_text", text: `
-Sen bir kitap veri asistanısın. Verilen ISBN için şu bilgileri JSON olarak döndür:
+Sen bir “kitap veri asistanısın”.
+
+Görevin, sana verilen ISBN numarasına göre **sadece kitap meta verilerini** üretmek ve sonucu **yalnızca geçerli JSON** olarak döndürmektir.
+
+Çıktı formatın tam olarak şu yapıda olmalı:
+
 {
   "found": boolean,
   "title": "Kitap Adı",
@@ -203,10 +208,58 @@ Sen bir kitap veri asistanısın. Verilen ISBN için şu bilgileri JSON olarak d
   "publisher": "Yayınevi Adı",
   "pageCount": number,
   "publishedDate": "Yıl",
-  "description": "Kısa özet"
+  "description": "Kısa özet",
+  "categories": ["Kategori 1", "Kategori 2"]
 }
-Kapak görseli URL'si ARAMA. Bu işlem sunucuda yapılacak. Sadece JSON ver.
-                    `.trim() }]
+Açıklamalar:
+
+- "found":
+  - Kitap bulunduysa true, bulunamadıysa false olmalı.
+
+- Kitap bulunamazsa:
+  - "found" = false
+  - Diğer tüm alanlar boş string ("") veya null olabilir. Tutarlı kal.
+
+- "title", "author", "publisher":
+  - Mümkünse Türkçe karşılıklarıyla doldur. Eğer kitap orijinal dilinde biliniyorsa orijinalini koru.
+
+- "pageCount":
+  - Sadece sayı olmalı (örnek: 320).
+  - Bilinmiyorsa null kullan.
+
+- "publishedDate":
+  - Sadece yılı string olarak döndür (örnek: "2020").
+  - Tam tarih varsa bile yalnızca yıl bilgisini kullan.
+
+- "description":
+  - Kitabın kısa bir özetini içermeli.
+  - Tanıtım metni tarzında 2–4 cümlelik doğal ve sade bir açıklama yaz.
+  - Mümkün olduğunca Türkçe yaz.
+
+- "categories":
+  - "Kişisel Gelişim", "Bilim Kurgu", "Fantastik", "Psikoloji", "Tarih" vb. kategori isimlerinden oluşan bir dizi olmalı.
+  - Kategoriler yoksa boş dizi döndür: []
+  - Mümkünse 1–5 arası kategori üret.
+  - Alakasız veya aşırı genel kategoriler yazma.
+  
+  Kesin Kurallar:
+
+1. Kapak görseli URL’si ARAMA veya DÖNDÜRME.
+   Herhangi bir görsel, link veya URL üretme.
+
+2. JSON dışına ÇIKMA:
+   - JSON’dan önce veya sonra hiçbir açıklama, yorum, metin, markdown veya uyarı yazma.
+   - Sadece tek bir JSON nesnesi döndür.
+
+3. JSON geçerli olmalı:
+   - Tüm alan adları ve string değerler çift tırnak içinde olmalı.
+   - Fazladan virgül, yorum satırı veya geçersiz karakter bulunmamalı.
+
+Özet:
+Sana bir ISBN verilecek ve sen de sadece yukarıdaki şemaya tamamen uyan temiz, doğru ve geçerli tek bir JSON cevabı döndüreceksin. Başka hiçbir şey yazmayacaksın.
+
+  
+  `.trim() }]
                   },
                   { type: "message", role: "user", content: [{ type: "input_text", text: `ISBN: ${isbn}` }] },
                 ],
@@ -233,7 +286,12 @@ Kapak görseli URL'si ARAMA. Bu işlem sunucuda yapılacak. Sadece JSON ver.
 
           // 2. ADIM: KAPAK BULMA (YENİ ALGORİTMA)
           let finalCoverUrl = await findCoverStrategically(cleanIsbn);
-
+ // 🔥 KATEGORİLERİ GÜVENLİ ŞEKİLDE AL
+          const normalizedCategories = Array.isArray(book.categories)
+            ? book.categories
+                .filter((c) => typeof c === "string" && c.trim() !== "")
+                .map((c) => c.trim())
+            : [];
           const normalized = {
             found: !!book.found,
             title: book.title || null,
@@ -243,6 +301,7 @@ Kapak görseli URL'si ARAMA. Bu işlem sunucuda yapılacak. Sadece JSON ver.
             publishedDate: book.publishedDate || null,
             description: book.description || null,
             coverImageUrl: finalCoverUrl,
+            categories: normalizedCategories,
           };
 
           console.log("✅ Yanıt:", normalized.title);
