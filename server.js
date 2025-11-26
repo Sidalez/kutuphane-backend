@@ -155,50 +155,65 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === "POST" && req.url === "/api/books/ai") {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk; });
+// ---------------------------------------------
+// AI ile ISBN → kitap bilgisi alan endpoint
+// ---------------------------------------------
+if (req.method === "POST" && req.url === "/api/books/ai") {
+  let body = "";
 
-    req.on("end", () => {
-      (async () => {
+  req.on("data", (chunk) => {
+    body += chunk;
+  });
+
+  req.on("end", () => {
+    (async () => {
+      try {
+        setCorsHeaders(res);
+
+        // ---- ISBN'i body'den al ----
+        let isbn = "";
         try {
-          setCorsHeaders(res);
-          let isbn = "";
-          try {
-            const parsed = JSON.parse(body || "{}");
-            isbn = (parsed.isbn || "").toString().trim();
-          } catch (e) {}
+          const parsed = JSON.parse(body || "{}");
+          isbn = (parsed.isbn || "").toString().trim();
+        } catch (e) {}
 
-          if (!isbn) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ found: false, message: "ISBN eksik" }));
-            return;
-          }
+        if (!isbn) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({ found: false, message: "ISBN eksik." })
+          );
+          return;
+        }
 
-          console.log("📚 Gelen ISBN:", isbn);
-         const cleanIsbn = isbn.replace(/[^\dXx]/g, "");
-          const promptIsbn = cleanIsbn || isbn; // AI için kullanılacak net ISBN
+        console.log("📚 Gelen ISBN:", isbn);
 
-          // 1. ADIM: OpenAI (Metadata) - Değişmedi
-          const openaiRes = await fetch(
-            "https://api.openai.com/v1/responses",
-            {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${OPENAI_API_KEY}`,
-              },
-                    body: JSON.stringify({
-                model: "gpt-4o-mini",
-                tools: [{ type: "web_search" }],
-                input: [
-                  {
-                    type: "message",
-                    role: "system",
-                    content: [
-                      {
-                        type: "input_text",
-                        text: `
+        // Sadece rakam ve X/x bırak
+        const cleanIsbn = isbn.replace(/[^\dXx]/g, "");
+        const promptIsbn = cleanIsbn || isbn;
+
+        // -----------------------------
+        // 1. ADIM: OpenAI'den kitap meta verisi
+        // -----------------------------
+        const openaiRes = await fetch(
+          "https://api.openai.com/v1/responses",
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify({
+              model: "gpt-4o-mini",
+              tools: [{ type: "web_search" }],
+              temperature: 0, // tahmin güdüsünü azalt
+              input: [
+                {
+                  type: "message",
+                  role: "system",
+                  content: [
+                    {
+                      type: "input_text",
+                      text: `
 Sen bir “kitap veri asistanısın”.
 
 Görevin, sana verilen ISBN numarasına göre **sadece kitap meta verilerini** üretmek ve sonucu **yalnızca geçerli JSON** olarak döndürmektir.
@@ -207,6 +222,7 @@ Görevin, sana verilen ISBN numarasına göre **sadece kitap meta verilerini** �
 
 {
   "found": boolean,
+  "sourceIsbn": "Bulduğun kaynaktaki gerçek ISBN veya null",
   "title": "Kitap Adı",
   "author": "Yazar Adı",
   "publisher": "Yayınevi Adı",
@@ -216,13 +232,12 @@ Görevin, sana verilen ISBN numarasına göre **sadece kitap meta verilerini** �
   "categories": ["Kategori 1", "Kategori 2"]
 }
 
-ÖNEMLİ ISBN KURALLARI (HATA TOLERANSI YOK):
+ÖNEMLİ ISBN KURALLARI:
 
 - Sana verilecek ISBN şudur: ${promptIsbn}
 - Web araması yaparken SADECE bu ISBN ile birebir eşleşen kitapları kullan.
 - ISBN alanında ${promptIsbn} NUMARASINI AÇIKÇA GÖSTERMeyen hiçbir sonucu KABUL ETME.
-- Sadece benzer isimli kitaplara veya serilere asla güvenme; ISBN eşleşmesi YOKSA "found": false döndür.
-- Aynı kitabın farklı baskıları varsa, yine de ISBN tam eşleşmesine göre karar ver.
+- ISBN tam olarak eşleşmiyorsa "found": false ve "sourceIsbn": null döndür.
 - Emin OLAMAZSAN, TAHMİN ETME → "found": false döndür.
 
 Açıklamalar:
@@ -230,33 +245,28 @@ Açıklamalar:
 - "found":
   - Kitap bulunduysa true, bulunamadıysa false olmalı.
 
-- Kitap bulunamazsa:
-  - "found" = false
-  - Diğer tüm alanlar boş string ("") veya null olabilir. Tutarlı kal.
+- "sourceIsbn":
+  - İnternette gördüğün, "ISBN" alanındaki gerçek değeri yaz.
+  - Eğer bulamazsan veya emin değilsen null kullan.
 
 - "title", "author", "publisher":
   - Mümkünse Türkçe karşılıklarıyla doldur. Eğer kitap Türkiye'de yayımlanmışsa, Türkçe adı ve yayınevini bulmaya çalış.
   - Eğer sadece orijinal dilde bulabiliyorsan, orijinal başlığı ve yazarı kullan.
 
 - "pageCount":
-  - Sadece sayı olmalı (örnek: 320).
-  - Bilinmiyorsa null kullan.
+  - Sadece sayı olmalı (örnek: 320). Bilinmiyorsa null kullan.
 
 - "publishedDate":
   - Sadece yılı string olarak döndür (örnek: "2014").
-  - Tam tarih varsa bile yalnızca yıl bilgisini kullan.
 
 - "description":
-  - Kitabın kısa bir özetini içermeli.
-  - Tanıtım metni tarzında 2–4 cümlelik doğal ve sade bir açıklama yaz.
+  - Kitabın kısa bir özetini içermeli (2–4 cümle).
   - Mümkün olduğunca Türkçe yaz.
 
 - "categories":
-  - "Kişisel Gelişim", "Bilim Kurgu", "Fantastik", "Psikoloji", "Tarih" vb. kategori isimlerinden oluşan bir dizi olmalı.
-  - Kategoriler yoksa boş dizi döndür: []
-  - Mümkünse 1–5 arası kategori üret.
-  - Alakasız veya aşırı genel kategoriler yazma.
-  
+  - "Kişisel Gelişim", "Bilim Kurgu", "Fantastik", "Psikoloji", "Tarih" vb. kategori isimlerinden oluşan bir dizi.
+  - Kategoriler yoksa boş dizi döndür: [].
+
 Kesin Kurallar:
 
 1. Kapak görseli, link, URL veya görsel kaynağı ASLA üretme.
@@ -265,82 +275,157 @@ Kesin Kurallar:
    - Sadece tek bir JSON nesnesi döndür.
 3. JSON geçerli olmalı:
    - Tüm alan adları ve string değerler çift tırnak içinde olmalı.
-   - Fazladan virgül, yorum satırı veya geçersiz karakter bulunmamalı.
+   - Fazladan virgül, yorum, vs. olmamalı.
 
 Özet:
 Sana bir ISBN verilecek (ISBN: ${promptIsbn}) ve sen de sadece yukarıdaki şemaya tamamen uyan temiz, doğru ve geçerli tek bir JSON cevabı döndüreceksin. Başka hiçbir şey yazmayacaksın.
-`.trim(),
-                      },
-                    ],
-                  },
-                  {
-                    type: "message",
-                    role: "user",
-                    content: [
-                      {
-                        type: "input_text",
-                        text: `Lütfen sadece ISBN ${promptIsbn} için meta veriyi döndür.`
-                      },
-                    ],
-                  },
-                ],
-              }),
-
-            }
-          );
-
-          const openaiJson = await openaiRes.json();
-          if (!openaiRes.ok) throw new Error(openaiJson?.error?.message || "OpenAI Error");
-
-          let text = "";
-          const outputItems = openaiJson.output || [];
-          const messageItem = outputItems.find(i => i.type === "message" && i.role === "assistant") || outputItems[0];
-          if (messageItem?.content) {
-             const textPart = messageItem.content.find(c => c.type === "output_text");
-             if (textPart) text = textPart.text;
+                      `.trim(),
+                    },
+                  ],
+                },
+                {
+                  type: "message",
+                  role: "user",
+                  content: [
+                    {
+                      type: "input_text",
+                      text: `Lütfen sadece ISBN ${promptIsbn} için meta veriyi döndür.`,
+                    },
+                  ],
+                },
+              ],
+            }),
           }
+        );
 
-          let book = {};
-          try {
-            let cleaned = text.replace(/```json|```/g, "").trim();
-            book = JSON.parse(cleaned);
-          } catch (e) { console.error("JSON Parse Error:", e); }
-
-          // 2. ADIM: KAPAK BULMA (YENİ ALGORİTMA)
-          let finalCoverUrl = await findCoverStrategically(cleanIsbn);
- // 🔥 KATEGORİLERİ GÜVENLİ ŞEKİLDE AL
-          const normalizedCategories = Array.isArray(book.categories)
-            ? book.categories
-                .filter((c) => typeof c === "string" && c.trim() !== "")
-                .map((c) => c.trim())
-            : [];
-           const normalized = {
-            found: !!book.found,
-            isbn: promptIsbn || null,
-            title: book.title || null,
-            author: book.author || null,
-            publisher: book.publisher || null,
-            pageCount: book.pageCount ? Number(book.pageCount) : null,
-            publishedDate: book.publishedDate || null,
-            description: book.description || null,
-            coverImageUrl: finalCoverUrl,
-            categories: normalizedCategories,
-          };
-
-          console.log("✅ Yanıt:", normalized.title);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify(normalized));
-
-        } catch (err) {
-          console.error("💥 Hata:", err);
-          setCorsHeaders(res);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ found: false, message: err.message }));
+        const openaiJson = await openaiRes.json();
+        if (!openaiRes.ok) {
+          console.error("❌ OpenAI /api/books/ai hata:", openaiJson);
+          throw new Error(
+            openaiJson?.error?.message ||
+              `OpenAI hata: ${openaiRes.status}`
+          );
         }
-      })();
-    });
-    return;
-  }
+
+        // responses API'den assistant text'i çek
+        let text = "";
+        const outputItems = Array.isArray(openaiJson.output)
+          ? openaiJson.output
+          : [];
+        const messageItem =
+          outputItems.find(
+            (item) =>
+              item.type === "message" && item.role === "assistant"
+          ) || outputItems[0];
+
+        if (
+          messageItem &&
+          Array.isArray(messageItem.content) &&
+          messageItem.content.length > 0
+        ) {
+          const textPart = messageItem.content.find(
+            (c) => c.type === "output_text"
+          );
+          if (textPart && typeof textPart.text === "string") {
+            text = textPart.text.trim();
+          }
+        }
+
+        // JSON'a çevir
+        let book = {};
+        try {
+          const cleaned = text
+            .replace(/```json/gi, "")
+            .replace(/```/g, "")
+            .trim();
+          book = JSON.parse(cleaned || "{}");
+        } catch (e) {
+          console.error("JSON Parse Error (ISBN):", e);
+        }
+
+        // ---------- EK GÜVENLİK: ISBN EŞLEŞMESİ ----------
+        const sourceIsbnRaw =
+          typeof book.sourceIsbn === "string" ? book.sourceIsbn : "";
+        const sourceIsbnClean = sourceIsbnRaw.replace(/[^\dXx]/g, "");
+        const isbnMatches =
+          sourceIsbnClean &&
+          sourceIsbnClean.length >= 10 &&
+          sourceIsbnClean === cleanIsbn;
+
+        if (!book.found || !isbnMatches) {
+          console.warn(
+            "⚠️ AI kitap bulamadı veya ISBN tam eşleşmedi. Güvenli şekilde boş dönülüyor.",
+            { promptIsbn, sourceIsbnRaw }
+          );
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              found: false,
+              message:
+                "Bu ISBN için güvenilir bir kayıt bulunamadı. Bilgileri manuel girebilirsin.",
+            })
+          );
+          return;
+        }
+
+        // -------------------------------
+        // 2. ADIM: KAPAK BULMA
+        // 📌 Senin algoritmana HİÇ dokunmuyoruz
+        // -------------------------------
+        let finalCoverUrl = null;
+        try {
+          // BURADA SADECE cleanIsbn kullanıyoruz, senin önceki çağrın nasılsa öyle kalsın
+          finalCoverUrl = await findCoverStrategically(cleanIsbn);
+        } catch (e) {
+          console.error("Kapak bulma hatası:", e);
+        }
+
+        // 🔥 KATEGORİLERİ GÜVENLİ ŞEKİLDE AL
+        const normalizedCategories = Array.isArray(book.categories)
+          ? book.categories
+              .filter(
+                (c) => typeof c === "string" && c.trim() !== ""
+              )
+              .map((c) => c.trim())
+          : [];
+
+        // 👉 FRONTEND'E GİDEN YAPI (HİÇ DEĞİŞMEDİ)
+        const normalized = {
+          found: true,
+          title: book.title || null,
+          author: book.author || null,
+          publisher: book.publisher || null,
+          pageCount: book.pageCount
+            ? Number(book.pageCount)
+            : null,
+          publishedDate: book.publishedDate || null,
+          description: book.description || null,
+          coverImageUrl: finalCoverUrl,
+          categories: normalizedCategories,
+        };
+
+        console.log("✅ ISBN yanıtı:", normalized.title);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(normalized));
+      } catch (err) {
+        console.error("💥 /api/books/ai hata:", err);
+        setCorsHeaders(res);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            found: false,
+            message:
+              err?.message ||
+              "Sunucu tarafında bir hata oluştu (ISBN AI).",
+          })
+        );
+      }
+    })();
+  });
+
+  return;
+}
+
 
   // ---------------------------------------------
 // 2) OKUMA ÖNERİSİ ENDPOINTİ  /api/ai/recommend
