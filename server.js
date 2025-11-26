@@ -176,7 +176,8 @@ const server = http.createServer((req, res) => {
           }
 
           console.log("📚 Gelen ISBN:", isbn);
-          const cleanIsbn = isbn.replace(/[^\dXx]/g, "");
+         const cleanIsbn = isbn.replace(/[^\dXx]/g, "");
+          const promptIsbn = cleanIsbn || isbn; // AI için kullanılacak net ISBN
 
           // 1. ADIM: OpenAI (Metadata) - Değişmedi
           const openaiRes = await fetch(
@@ -187,14 +188,17 @@ const server = http.createServer((req, res) => {
                 "Content-Type": "application/json",
                 Authorization: `Bearer ${OPENAI_API_KEY}`,
               },
-              body: JSON.stringify({
+                    body: JSON.stringify({
                 model: "gpt-4o-mini",
                 tools: [{ type: "web_search" }],
                 input: [
                   {
                     type: "message",
                     role: "system",
-                    content: [{ type: "input_text", text: `
+                    content: [
+                      {
+                        type: "input_text",
+                        text: `
 Sen bir “kitap veri asistanısın”.
 
 Görevin, sana verilen ISBN numarasına göre **sadece kitap meta verilerini** üretmek ve sonucu **yalnızca geçerli JSON** olarak döndürmektir.
@@ -211,6 +215,16 @@ Görevin, sana verilen ISBN numarasına göre **sadece kitap meta verilerini** �
   "description": "Kısa özet",
   "categories": ["Kategori 1", "Kategori 2"]
 }
+
+ÖNEMLİ ISBN KURALLARI (HATA TOLERANSI YOK):
+
+- Sana verilecek ISBN şudur: ${promptIsbn}
+- Web araması yaparken SADECE bu ISBN ile birebir eşleşen kitapları kullan.
+- ISBN alanında ${promptIsbn} NUMARASINI AÇIKÇA GÖSTERMeyen hiçbir sonucu KABUL ETME.
+- Sadece benzer isimli kitaplara veya serilere asla güvenme; ISBN eşleşmesi YOKSA "found": false döndür.
+- Aynı kitabın farklı baskıları varsa, yine de ISBN tam eşleşmesine göre karar ver.
+- Emin OLAMAZSAN, TAHMİN ETME → "found": false döndür.
+
 Açıklamalar:
 
 - "found":
@@ -221,14 +235,15 @@ Açıklamalar:
   - Diğer tüm alanlar boş string ("") veya null olabilir. Tutarlı kal.
 
 - "title", "author", "publisher":
-  - Mümkünse Türkçe karşılıklarıyla doldur. Eğer kitap orijinal dilinde biliniyorsa orijinalini koru.
+  - Mümkünse Türkçe karşılıklarıyla doldur. Eğer kitap Türkiye'de yayımlanmışsa, Türkçe adı ve yayınevini bulmaya çalış.
+  - Eğer sadece orijinal dilde bulabiliyorsan, orijinal başlığı ve yazarı kullan.
 
 - "pageCount":
   - Sadece sayı olmalı (örnek: 320).
   - Bilinmiyorsa null kullan.
 
 - "publishedDate":
-  - Sadece yılı string olarak döndür (örnek: "2020").
+  - Sadece yılı string olarak döndür (örnek: "2014").
   - Tam tarih varsa bile yalnızca yıl bilgisini kullan.
 
 - "description":
@@ -242,28 +257,35 @@ Açıklamalar:
   - Mümkünse 1–5 arası kategori üret.
   - Alakasız veya aşırı genel kategoriler yazma.
   
-  Kesin Kurallar:
+Kesin Kurallar:
 
-1. Kapak görseli URL’si ARAMA veya DÖNDÜRME.
-   Herhangi bir görsel, link veya URL üretme.
-
+1. Kapak görseli, link, URL veya görsel kaynağı ASLA üretme.
 2. JSON dışına ÇIKMA:
    - JSON’dan önce veya sonra hiçbir açıklama, yorum, metin, markdown veya uyarı yazma.
    - Sadece tek bir JSON nesnesi döndür.
-
 3. JSON geçerli olmalı:
    - Tüm alan adları ve string değerler çift tırnak içinde olmalı.
    - Fazladan virgül, yorum satırı veya geçersiz karakter bulunmamalı.
 
 Özet:
-Sana bir ISBN verilecek ve sen de sadece yukarıdaki şemaya tamamen uyan temiz, doğru ve geçerli tek bir JSON cevabı döndüreceksin. Başka hiçbir şey yazmayacaksın.
-
-  
-  `.trim() }]
+Sana bir ISBN verilecek (ISBN: ${promptIsbn}) ve sen de sadece yukarıdaki şemaya tamamen uyan temiz, doğru ve geçerli tek bir JSON cevabı döndüreceksin. Başka hiçbir şey yazmayacaksın.
+`.trim(),
+                      },
+                    ],
                   },
-                  { type: "message", role: "user", content: [{ type: "input_text", text: `ISBN: ${isbn}` }] },
+                  {
+                    type: "message",
+                    role: "user",
+                    content: [
+                      {
+                        type: "input_text",
+                        text: `Lütfen sadece ISBN ${promptIsbn} için meta veriyi döndür.`
+                      },
+                    ],
+                  },
                 ],
               }),
+
             }
           );
 
@@ -292,8 +314,9 @@ Sana bir ISBN verilecek ve sen de sadece yukarıdaki şemaya tamamen uyan temiz,
                 .filter((c) => typeof c === "string" && c.trim() !== "")
                 .map((c) => c.trim())
             : [];
-          const normalized = {
+           const normalized = {
             found: !!book.found,
+            isbn: promptIsbn || null,
             title: book.title || null,
             author: book.author || null,
             publisher: book.publisher || null,
