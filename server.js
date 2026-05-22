@@ -1,8 +1,9 @@
 // backend/server.js
 // Node 18+ gerektirir.
-// ISBN seed: Serper Images ilk sonuç title
-// Kapak görseli: Serper Images ilk sonuç imageUrl
+// Kitap ISBN seed: Serper Images ilk sonuç title
+// Kitap kapak görseli: Serper Images ilk sonuç imageUrl
 // Kitap detayları: Gemini
+// Film/Dizi verileri: TMDb
 // OpenAI / OpenRouter yoktur.
 
 const path = require("path");
@@ -20,8 +21,16 @@ function normalizeEnvValue(value) {
 }
 
 const GEMINI_API_KEY = normalizeEnvValue(process.env.GEMINI_API_KEY);
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
 const SERPER_API_KEY = normalizeEnvValue(process.env.SERPER_API_KEY);
+
+const TMDB_ACCESS_TOKEN = normalizeEnvValue(process.env.TMDB_ACCESS_TOKEN);
+const TMDB_LANGUAGE = process.env.TMDB_LANGUAGE || "tr-TR";
+const TMDB_REGION = process.env.TMDB_REGION || "TR";
+
+const TMDB_API_BASE = "https://api.themoviedb.org/3";
+const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p";
+
 const PORT = process.env.PORT || 3001;
 
 const NO_PHOTO_URL =
@@ -37,9 +46,18 @@ if (!SERPER_API_KEY) {
   process.exit(1);
 }
 
+if (!TMDB_ACCESS_TOKEN) {
+  console.warn("⚠️ TMDB_ACCESS_TOKEN bulunamadı. Medya endpointleri çalışmaz.");
+}
+
 console.log("🔑 Gemini key okundu:", GEMINI_API_KEY.slice(0, 8) + "...");
 console.log("🤖 Gemini model:", GEMINI_MODEL);
 console.log("🖼️ Serper key okundu:", SERPER_API_KEY.slice(0, 8) + "...");
+console.log("🎬 TMDb token:", TMDB_ACCESS_TOKEN ? "okundu" : "eksik");
+
+// ----------------------------------------------------------------
+// GENEL HELPERS
+// ----------------------------------------------------------------
 
 function setCorsHeaders(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -399,7 +417,7 @@ async function findYandexImage(title, author) {
 }
 
 // ----------------------------------------------------------------
-// ISBN → SERPER IMAGE TITLE → GEMINI DETAILS
+// KITAP: ISBN → SERPER IMAGE TITLE → GEMINI DETAILS
 // ----------------------------------------------------------------
 
 async function getBookDetailsFromGeminiBySerperTitle({ isbn, seed }) {
@@ -501,6 +519,250 @@ Kurallar:
         ? parsed.description.trim()
         : null,
     categories: Array.isArray(parsed.categories) ? parsed.categories : [],
+  };
+}
+
+// ----------------------------------------------------------------
+// TMDB MEDIA HELPERS
+// ----------------------------------------------------------------
+
+function buildTmdbImageUrl(imagePath, size = "w500") {
+  if (!imagePath) return null;
+  return `${TMDB_IMAGE_BASE}/${size}${imagePath}`;
+}
+
+function getYearFromDate(date) {
+  if (!date || typeof date !== "string") return "";
+  return date.slice(0, 4);
+}
+
+function roundRating(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n * 10) / 10;
+}
+
+async function tmdbRequest(endpoint, params = {}) {
+  if (!TMDB_ACCESS_TOKEN) {
+    throw new Error("TMDB_ACCESS_TOKEN eksik. Backend .env dosyasını kontrol et.");
+  }
+
+  const url = new URL(`${TMDB_API_BASE}${endpoint}`);
+
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(key, String(value));
+    }
+  });
+
+  const response = await fetch(url.toString(), {
+    method: "GET",
+    headers: {
+      accept: "application/json",
+      Authorization: `Bearer ${TMDB_ACCESS_TOKEN}`,
+    },
+  });
+
+  const rawText = await response.text();
+
+  let data = {};
+  try {
+    data = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    console.error("❌ TMDb JSON olmayan cevap:", rawText.slice(0, 1000));
+    throw new Error(`TMDb geçerli JSON döndürmedi. HTTP: ${response.status}`);
+  }
+
+  if (!response.ok) {
+    console.error("❌ TMDb hata:", JSON.stringify(data, null, 2));
+    throw new Error(data?.status_message || `TMDb hata: ${response.status}`);
+  }
+
+  return data;
+}
+
+function normalizeMovieSearchResult(item) {
+  return {
+    tmdbId: item.id,
+    type: "MOVIE",
+    title: item.title || item.original_title || "",
+    originalTitle: item.original_title || "",
+    year: getYearFromDate(item.release_date),
+    overview: item.overview || "",
+    posterUrl: buildTmdbImageUrl(item.poster_path, "w342"),
+    backdropUrl: buildTmdbImageUrl(item.backdrop_path, "w780"),
+    tmdbRating: roundRating(item.vote_average),
+  };
+}
+
+function normalizeTvSearchResult(item) {
+  return {
+    tmdbId: item.id,
+    type: "TV",
+    title: item.name || item.original_name || "",
+    originalTitle: item.original_name || "",
+    year: getYearFromDate(item.first_air_date),
+    overview: item.overview || "",
+    posterUrl: buildTmdbImageUrl(item.poster_path, "w342"),
+    backdropUrl: buildTmdbImageUrl(item.backdrop_path, "w780"),
+    tmdbRating: roundRating(item.vote_average),
+  };
+}
+
+function getYoutubeTrailerUrl(videos) {
+  const results = Array.isArray(videos?.results) ? videos.results : [];
+
+  const trailer =
+    results.find(
+      (video) =>
+        video.site === "YouTube" &&
+        video.type === "Trailer" &&
+        video.official === true
+    ) ||
+    results.find(
+      (video) => video.site === "YouTube" && video.type === "Trailer"
+    ) ||
+    results.find((video) => video.site === "YouTube");
+
+  if (!trailer?.key) return null;
+
+  return `https://www.youtube.com/watch?v=${trailer.key}`;
+}
+
+function getMovieDirector(credits) {
+  const crew = Array.isArray(credits?.crew) ? credits.crew : [];
+  const director = crew.find((person) => person.job === "Director");
+  return director?.name || null;
+}
+
+function getCastNames(credits, limit = 10) {
+  const cast = Array.isArray(credits?.cast) ? credits.cast : [];
+
+  return cast
+    .slice(0, limit)
+    .map((person) => person.name || person.original_name)
+    .filter(Boolean);
+}
+
+function getTvCastNames(aggregateCredits, limit = 10) {
+  const cast = Array.isArray(aggregateCredits?.cast)
+    ? aggregateCredits.cast
+    : [];
+
+  return cast
+    .slice(0, limit)
+    .map((person) => person.name || person.original_name)
+    .filter(Boolean);
+}
+
+function getWatchProviders(providerData) {
+  const regionData = providerData?.results?.[TMDB_REGION];
+
+  if (!regionData) return [];
+
+  const allProviders = [
+    ...(Array.isArray(regionData.flatrate) ? regionData.flatrate : []),
+    ...(Array.isArray(regionData.rent) ? regionData.rent : []),
+    ...(Array.isArray(regionData.buy) ? regionData.buy : []),
+    ...(Array.isArray(regionData.ads) ? regionData.ads : []),
+  ];
+
+  const seen = new Set();
+
+  return allProviders
+    .map((provider) => provider.provider_name)
+    .filter(Boolean)
+    .filter((name) => {
+      if (seen.has(name)) return false;
+      seen.add(name);
+      return true;
+    });
+}
+
+function normalizeMovieDetails(data) {
+  const externalIds = data.external_ids || {};
+  const credits = data.credits || {};
+  const providers = data["watch/providers"] || {};
+
+  return {
+    tmdbId: data.id,
+    imdbId: externalIds.imdb_id || null,
+    type: "MOVIE",
+
+    title: data.title || data.original_title || "",
+    originalTitle: data.original_title || "",
+    year: getYearFromDate(data.release_date),
+    overview: data.overview || "",
+
+    posterUrl: buildTmdbImageUrl(data.poster_path, "w500"),
+    backdropUrl: buildTmdbImageUrl(data.backdrop_path, "w1280"),
+    trailerUrl: getYoutubeTrailerUrl(data.videos),
+
+    genres: Array.isArray(data.genres) ? data.genres.map((g) => g.name) : [],
+    platforms: getWatchProviders(providers),
+
+    runtime: typeof data.runtime === "number" ? data.runtime : null,
+
+    director: getMovieDirector(credits),
+    creators: [],
+    cast: getCastNames(credits, 10),
+
+    tmdbRating: roundRating(data.vote_average),
+    imdbRating: null,
+  };
+}
+
+function normalizeTvDetails(data) {
+  const externalIds = data.external_ids || {};
+  const aggregateCredits = data.aggregate_credits || {};
+  const providers = data["watch/providers"] || {};
+
+  const seasons = Array.isArray(data.seasons)
+    ? data.seasons
+        .filter((season) => season.season_number > 0)
+        .map((season) => ({
+          seasonNumber: season.season_number,
+          name: season.name || `Sezon ${season.season_number}`,
+          episodeCount: season.episode_count || 0,
+          airDate: season.air_date || null,
+          posterUrl: buildTmdbImageUrl(season.poster_path, "w342"),
+        }))
+    : [];
+
+  return {
+    tmdbId: data.id,
+    imdbId: externalIds.imdb_id || null,
+    type: "TV",
+
+    title: data.name || data.original_name || "",
+    originalTitle: data.original_name || "",
+    year: getYearFromDate(data.first_air_date),
+    overview: data.overview || "",
+
+    posterUrl: buildTmdbImageUrl(data.poster_path, "w500"),
+    backdropUrl: buildTmdbImageUrl(data.backdrop_path, "w1280"),
+    trailerUrl: getYoutubeTrailerUrl(data.videos),
+
+    genres: Array.isArray(data.genres) ? data.genres.map((g) => g.name) : [],
+    platforms: getWatchProviders(providers),
+
+    runtime:
+      Array.isArray(data.episode_run_time) && data.episode_run_time.length > 0
+        ? data.episode_run_time[0]
+        : null,
+
+    numberOfSeasons: data.number_of_seasons || seasons.length || 0,
+    numberOfEpisodes: data.number_of_episodes || 0,
+    seasons,
+
+    director: null,
+    creators: Array.isArray(data.created_by)
+      ? data.created_by.map((c) => c.name).filter(Boolean)
+      : [],
+    cast: getTvCastNames(aggregateCredits, 10),
+
+    tmdbRating: roundRating(data.vote_average),
+    imdbRating: null,
   };
 }
 
@@ -659,12 +921,23 @@ const server = http.createServer((req, res) => {
     return json(res, 200, {
       ok: true,
       message: "Backend çalışıyor.",
-      isbnSeed: "Serper Images first title",
-      details: "Gemini",
-      cover: "Serper Images first imageUrl",
+      book: {
+        isbnSeed: "Serper Images first title",
+        details: "Gemini",
+        cover: "Serper Images first imageUrl",
+      },
+      media: {
+        source: "TMDb",
+        language: TMDB_LANGUAGE,
+        region: TMDB_REGION,
+      },
       model: GEMINI_MODEL,
     });
   }
+
+  // ------------------------------------------------------------
+  // KITAP ISBN AI
+  // ------------------------------------------------------------
 
   if (req.method === "POST" && req.url === "/api/books/ai") {
     (async () => {
@@ -761,6 +1034,10 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ------------------------------------------------------------
+  // KITAP ÖNERİLERİ
+  // ------------------------------------------------------------
+
   if (req.method === "POST" && req.url === "/api/ai/recommend") {
     (async () => {
       try {
@@ -786,6 +1063,134 @@ const server = http.createServer((req, res) => {
 
     return;
   }
+
+  // ------------------------------------------------------------
+  // FILM / DIZI ARAMA
+  // ------------------------------------------------------------
+
+  if (req.method === "POST" && req.url === "/api/media/search") {
+    (async () => {
+      try {
+        const payload = await readBody(req);
+
+        const queryText = String(payload.query || "").trim();
+        const type = payload.type === "TV" ? "TV" : "MOVIE";
+        const year = String(payload.year || "").trim();
+
+        if (!queryText) {
+          return json(res, 400, {
+            success: false,
+            message: "Arama metni boş olamaz.",
+          });
+        }
+
+        const endpoint = type === "TV" ? "/search/tv" : "/search/movie";
+
+        const params =
+          type === "TV"
+            ? {
+                query: queryText,
+                language: TMDB_LANGUAGE,
+                include_adult: "false",
+                first_air_date_year: year || undefined,
+                page: 1,
+              }
+            : {
+                query: queryText,
+                language: TMDB_LANGUAGE,
+                region: TMDB_REGION,
+                include_adult: "false",
+                primary_release_year: year || undefined,
+                page: 1,
+              };
+
+        const data = await tmdbRequest(endpoint, params);
+
+        const results = Array.isArray(data.results)
+          ? data.results
+              .slice(0, 10)
+              .map((item) =>
+                type === "TV"
+                  ? normalizeTvSearchResult(item)
+                  : normalizeMovieSearchResult(item)
+              )
+          : [];
+
+        return json(res, 200, {
+          success: true,
+          data: results,
+        });
+      } catch (err) {
+        console.error("💥 /api/media/search hata:", err);
+
+        return json(res, 500, {
+          success: false,
+          message:
+            err?.message ||
+            "Film/dizi araması yapılırken sunucu hatası oluştu.",
+        });
+      }
+    })();
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // FILM / DIZI DETAY
+  // ------------------------------------------------------------
+
+  if (req.method === "POST" && req.url === "/api/media/details") {
+    (async () => {
+      try {
+        const payload = await readBody(req);
+
+        const tmdbId = Number(payload.tmdbId);
+        const type = payload.type === "TV" ? "TV" : "MOVIE";
+
+        if (!Number.isFinite(tmdbId) || tmdbId <= 0) {
+          return json(res, 400, {
+            success: false,
+            message: "Geçerli TMDb ID gönderilmedi.",
+          });
+        }
+
+        const endpoint = type === "TV" ? `/tv/${tmdbId}` : `/movie/${tmdbId}`;
+
+        const append =
+          type === "TV"
+            ? "videos,aggregate_credits,external_ids,watch/providers"
+            : "videos,credits,external_ids,watch/providers";
+
+        const data = await tmdbRequest(endpoint, {
+          language: TMDB_LANGUAGE,
+          append_to_response: append,
+        });
+
+        const normalized =
+          type === "TV" ? normalizeTvDetails(data) : normalizeMovieDetails(data);
+
+        return json(res, 200, {
+          success: true,
+          data: normalized,
+        });
+      } catch (err) {
+        console.error("💥 /api/media/details hata:", err);
+
+        return json(res, 500, {
+          success: false,
+          message:
+            err?.message ||
+            "Film/dizi detayları alınırken sunucu hatası oluştu.",
+        });
+      }
+    })();
+
+    return;
+  }
+
+  // ------------------------------------------------------------
+  // KITAP RECOMMENDATIONS ESKI ENDPOINT
+  // ------------------------------------------------------------
 
   const baseURL = "http://" + req.headers.host + "/";
   const myUrl = new URL(req.url, baseURL);
@@ -863,5 +1268,6 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`📡 Backend http://localhost:${PORT} üzerinde çalışıyor`);
-  console.log("🔎 Mod: Serper first imageUrl + Gemini Details");
+  console.log("🔎 Kitap Modu: Serper first imageUrl + Gemini Details");
+  console.log("🎬 Medya Modu: TMDb Search + Details");
 });
