@@ -1,8 +1,8 @@
 // backend/server.js
 // Node 18+ gerektirir.
-// ISBN seed: Serper Images
+// ISBN seed: Serper Images ilk sonuç title
+// Kapak görseli: Serper Images ilk sonuç imageUrl
 // Kitap detayları: Gemini
-// Kapak görseli: Serper Images
 // OpenAI / OpenRouter yoktur.
 
 const path = require("path");
@@ -154,37 +154,13 @@ function parseNumberOrNull(value) {
   return n;
 }
 
-function isImageUrl(url) {
-  if (typeof url !== "string") return false;
-
-  const cleanUrl = url.split("?")[0].toLowerCase();
-  return /\.(jpg|jpeg|png|webp)$/i.test(cleanUrl);
-}
-
-function isBadCoverUrl(url) {
-  if (!url) return true;
-
-  const lower = String(url).toLowerCase();
-
-  return (
-    lower.includes("gstatic.com") ||
-    lower.includes("google.com") ||
-    lower.includes("icon") ||
-    lower.includes("logo") ||
-    lower.includes("avatar") ||
-    lower.includes("placeholder") ||
-    lower.includes("no-image") ||
-    lower.includes("no_image") ||
-    lower.includes("no-photo") ||
-    lower.includes("no_photo") ||
-    lower.includes("sprite")
-  );
-}
-
 function cleanSeedTitle(title) {
   return cleanText(title)
     .replace(/\s+\|\s+.*$/g, "")
-    .replace(/\s+-\s+(Kitapyurdu|D&R|İdefix|Amazon|BKM Kitap|NadirKitap|Pandora).*$/gi, "")
+    .replace(
+      /\s+-\s+(Kitapyurdu|D&R|İdefix|Amazon|BKM Kitap|NadirKitap|Pandora).*$/gi,
+      ""
+    )
     .replace(/\s*Kitap\s*$/gi, "")
     .trim();
 }
@@ -334,263 +310,83 @@ async function serperImages(query, options = {}) {
   });
 }
 
-function pickBestSerperImageResult(images) {
-  if (!Array.isArray(images) || images.length === 0) return null;
+async function getFirstSerperImageUrl(query) {
+  console.log("🖼️ Serper Images araması:", query);
 
-  const goodSources = [
-    "kitapyurdu",
-    "dr.com.tr",
-    "d&r",
-    "idefix",
-    "bkmkitap",
-    "amazon",
-    "penguenkitap",
-    "kidega",
-    "nadirkitap",
-    "pandora",
-    "hepsiburada",
-  ];
+  const data = await serperImages(query, {
+    gl: "tr",
+    hl: "tr",
+    num: 10,
+  });
 
-  const scored = images
-    .map((item) => {
-      const imageUrl =
-        item.imageUrl ||
-        item.thumbnailUrl ||
-        item.image ||
-        item.url ||
-        "";
+  const images = Array.isArray(data?.images) ? data.images : [];
+  const first = images[0];
 
-      const meta = cleanText(
-        [
-          item.title,
-          item.source,
-          item.domain,
-          item.link,
-          imageUrl,
-        ]
-          .filter(Boolean)
-          .join(" ")
-      ).toLowerCase();
+  if (!first?.imageUrl) {
+    console.warn("⚠️ Serper ilk sonuçta imageUrl dönmedi.");
+    return {
+      imageUrl: NO_PHOTO_URL,
+      firstResult: null,
+      raw: data,
+    };
+  }
 
-      let score = 0;
+  console.log("✅ Serper ilk imageUrl:", first.imageUrl);
 
-      if (item.position) score += Math.max(0, 25 - Number(item.position));
-      if (item.title && item.title.trim().length > 3) score += 35;
-      if (imageUrl && !isBadCoverUrl(imageUrl)) score += 30;
-      if (isImageUrl(imageUrl)) score += 10;
-
-      for (const source of goodSources) {
-        if (meta.includes(source)) score += 25;
-      }
-
-      if (meta.includes("kitap")) score += 8;
-      if (meta.includes("book")) score += 8;
-      if (meta.includes("kapak")) score += 8;
-      if (meta.includes("cover")) score += 8;
-
-      if (isBadCoverUrl(imageUrl)) score -= 120;
-
-      return {
-        item,
-        imageUrl,
-        score,
-      };
-    })
-    .filter((x) => x.imageUrl && !isBadCoverUrl(x.imageUrl))
-    .sort((a, b) => b.score - a.score);
-
-  return scored[0]?.item || null;
+  return {
+    imageUrl: first.imageUrl,
+    firstResult: first,
+    raw: data,
+  };
 }
 
 async function findBookSeedFromSerperImage(isbn) {
   const clean = cleanIsbn(isbn);
+  const query = `ISBN:${clean}`;
 
-  const queries = [
-    `ISBN:${clean}`,
-    `"ISBN:${clean}"`,
-    `"${clean}" kitap kapağı`,
-  ];
+  const { imageUrl, firstResult } = await getFirstSerperImageUrl(query);
 
-  for (const query of queries) {
-    try {
-      console.log("🖼️ Serper ISBN görsel araması:", query);
+  if (!firstResult) {
+    return {
+      found: false,
+      message: "Serper Images ilk sonucunda uygun imageUrl bulunamadı.",
+    };
+  }
 
-      const data = await serperImages(query, {
-        gl: "tr",
-        hl: "tr",
-        num: 10,
-      });
+  const title = cleanSeedTitle(firstResult.title || "");
 
-      const images = Array.isArray(data?.images) ? data.images : [];
-      const best = pickBestSerperImageResult(images);
-
-      if (!best) continue;
-
-      const imageUrl =
-        best.imageUrl ||
-        best.thumbnailUrl ||
-        best.image ||
-        best.url ||
-        "";
-
-      const title = cleanSeedTitle(best.title || "");
-
-      if (!title || !imageUrl || isBadCoverUrl(imageUrl)) continue;
-
-      return {
-        found: true,
-        isbn: clean,
-        title,
-        imageUrl,
-        source: cleanText(best.source || ""),
-        domain: cleanText(best.domain || ""),
-        link: best.link || "",
-        position: best.position || null,
-        rawFirstResult: best,
-      };
-    } catch (error) {
-      console.warn("Serper ISBN görsel araması başarısız:", query, error.message);
-    }
+  if (!title) {
+    return {
+      found: false,
+      message: "Serper Images ilk sonucunda kitap başlığı okunamadı.",
+      imageUrl,
+      rawFirstResult: firstResult,
+    };
   }
 
   return {
-    found: false,
-    message: "Serper Images üzerinde bu ISBN için uygun kitap sonucu bulunamadı.",
+    found: true,
+    isbn: clean,
+    title,
+    imageUrl,
+    source: cleanText(firstResult.source || ""),
+    domain: cleanText(firstResult.domain || ""),
+    link: firstResult.link || "",
+    position: firstResult.position || 1,
+    rawFirstResult: firstResult,
   };
-}
-
-function scoreCoverCandidate(item, { isbn, title, author }) {
-  const imageUrl =
-    item.imageUrl || item.thumbnailUrl || item.image || item.url || "";
-
-  const meta = cleanText(
-    [
-      item.title,
-      item.source,
-      item.link,
-      item.domain,
-      imageUrl,
-      item.imageUrl,
-      item.thumbnailUrl,
-    ]
-      .filter(Boolean)
-      .join(" ")
-  ).toLowerCase();
-
-  let score = 0;
-
-  const clean = cleanIsbn(isbn);
-  const isbn10 = convertIsbn13to10(clean);
-
-  if (clean && meta.includes(clean.toLowerCase())) score += 80;
-  if (isbn10 && isbn10 !== clean && meta.includes(isbn10.toLowerCase())) {
-    score += 50;
-  }
-
-  const titleWords = cleanText(title)
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((w) => w.length > 2);
-
-  const authorWords = cleanText(author)
-    .toLowerCase()
-    .split(/\s+/)
-    .filter((w) => w.length > 2);
-
-  for (const word of titleWords.slice(0, 5)) {
-    if (meta.includes(word)) score += 8;
-  }
-
-  for (const word of authorWords.slice(0, 4)) {
-    if (meta.includes(word)) score += 5;
-  }
-
-  if (isImageUrl(imageUrl)) score += 15;
-
-  if (meta.includes("kitap")) score += 5;
-  if (meta.includes("book")) score += 5;
-  if (meta.includes("cover")) score += 5;
-  if (meta.includes("kapak")) score += 5;
-
-  if (isBadCoverUrl(imageUrl)) score -= 100;
-
-  return score;
 }
 
 async function findCoverWithSerperImage({ isbn, title, author, publisher }) {
   const clean = cleanIsbn(isbn);
 
-  const queries = [
-    clean ? `ISBN:${clean}` : "",
-    clean ? `"${clean}" kitap kapağı` : "",
-    `${title || ""} ${author || ""} kitap kapağı ${clean}`,
-    `${title || ""} ${author || ""} ${publisher || ""} kitap kapağı`,
-    `${title || ""} ${author || ""} book cover`,
-  ]
-    .map((q) => q.trim())
-    .filter(Boolean);
+  const query = clean
+    ? `ISBN:${clean}`
+    : `${title || ""} ${author || ""} ${publisher || ""} kitap kapağı`.trim();
 
-  const seen = new Set();
-  const candidates = [];
+  const { imageUrl } = await getFirstSerperImageUrl(query);
 
-  for (const query of queries) {
-    try {
-      console.log("🖼️ Serper kapak araması:", query);
-
-      const data = await serperImages(query, {
-        gl: "tr",
-        hl: "tr",
-        num: 10,
-      });
-
-      const images = Array.isArray(data?.images) ? data.images : [];
-
-      for (const item of images) {
-        const imageUrl =
-          item.imageUrl ||
-          item.thumbnailUrl ||
-          item.image ||
-          item.url ||
-          "";
-
-        if (!imageUrl) continue;
-        if (seen.has(imageUrl)) continue;
-        if (isBadCoverUrl(imageUrl)) continue;
-
-        seen.add(imageUrl);
-
-        candidates.push({
-          url: imageUrl,
-          score: scoreCoverCandidate(item, {
-            isbn: clean,
-            title,
-            author,
-          }),
-        });
-      }
-    } catch (error) {
-      console.warn("Serper kapak araması başarısız:", error.message);
-    }
-  }
-
-  const sorted = candidates.sort((a, b) => b.score - a.score);
-
-  const bestDirectImage = sorted.find((x) => isImageUrl(x.url));
-
-  if (bestDirectImage) {
-    console.log("✅ Kapak kaynağı: Serper Images", bestDirectImage.url);
-    return bestDirectImage.url;
-  }
-
-  const bestAnyImage = sorted[0];
-
-  if (bestAnyImage?.url) {
-    console.log("✅ Kapak kaynağı: Serper Images fallback", bestAnyImage.url);
-    return bestAnyImage.url;
-  }
-
-  console.log("⚠️ Serper kapak bulamadı, varsayılan görsel dönülüyor.");
-  return NO_PHOTO_URL;
+  return imageUrl || NO_PHOTO_URL;
 }
 
 async function findYandexImage(title, author) {
@@ -608,22 +404,26 @@ async function findYandexImage(title, author) {
 
 async function getBookDetailsFromGeminiBySerperTitle({ isbn, seed }) {
   const clean = cleanIsbn(isbn);
+  const isbn10 = convertIsbn13to10(clean);
 
   const prompt = `
 Sen bir kitap veri çıkarma asistanısın.
 
-Aşağıdaki ISBN, Serper Images üzerinde arandı ve kitap kapağı sonucundan bir başlık elde edildi.
+Aşağıdaki ISBN, Serper Images üzerinde "ISBN:${clean}" sorgusuyla arandı.
+Serper'ın ilk görsel sonucundan bir kitap başlığı ve kapak görseli elde edildi.
 Görevin bu başlığı ve ISBN bilgisini kullanarak kitabın alanlarını doğru şekilde doldurmaktır.
 
-ISBN: ${clean}
+ISBN-13: ${clean}
+ISBN-10: ${isbn10 || "Yok"}
 
-Serper Images sonucu:
+Serper Images ilk sonucu:
 ${JSON.stringify(
   {
     titleFromImageResult: seed.title,
     imageSource: seed.source,
     imageDomain: seed.domain,
     imageLink: seed.link,
+    imageUrl: seed.imageUrl,
   },
   null,
   2
@@ -859,9 +659,9 @@ const server = http.createServer((req, res) => {
     return json(res, 200, {
       ok: true,
       message: "Backend çalışıyor.",
-      isbnSeed: "Serper Images title",
+      isbnSeed: "Serper Images first title",
       details: "Gemini",
-      cover: "Serper Images",
+      cover: "Serper Images first imageUrl",
       model: GEMINI_MODEL,
     });
   }
@@ -1063,5 +863,5 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`📡 Backend http://localhost:${PORT} üzerinde çalışıyor`);
-  console.log("🔎 Mod: Serper Images ISBN Seed + Gemini Details");
+  console.log("🔎 Mod: Serper first imageUrl + Gemini Details");
 });
