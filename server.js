@@ -1,150 +1,654 @@
 // backend/server.js
-// Node 18+ gerektirir
-require("dotenv").config();
-const http = require("http");
-const axios = require("axios");
+// Node 18+ gerektirir.
+// Kitap bilgisi: Gemini
+// Kapak görseli: Serper Images API
+// OpenAI / OpenRouter yoktur.
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error("❌ OPENAI_API_KEY bulunamadı. .env dosyasını kontrol et.");
+const path = require("path");
+
+require("dotenv").config({ path: path.join(__dirname, ".env") });
+require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
+
+const http = require("http");
+
+function normalizeEnvValue(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^Bearer\s+/i, "")
+    .replace(/^["']|["']$/g, "");
+}
+
+const GEMINI_API_KEY = normalizeEnvValue(process.env.GEMINI_API_KEY);
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const SERPER_API_KEY = normalizeEnvValue(process.env.SERPER_API_KEY);
+const PORT = process.env.PORT || 3001;
+
+const NO_PHOTO_URL =
+  "https://cdn.vectorstock.com/i/500p/33/47/no-photo-available-icon-vector-40343347.jpg";
+
+if (!GEMINI_API_KEY) {
+  console.error("❌ GEMINI_API_KEY bulunamadı. .env dosyasını kontrol et.");
   process.exit(1);
 }
 
-const PORT = process.env.PORT || 3001;
+if (!SERPER_API_KEY) {
+  console.error("❌ SERPER_API_KEY bulunamadı. .env dosyasını kontrol et.");
+  process.exit(1);
+}
+
+console.log("🔑 Gemini key okundu:", GEMINI_API_KEY.slice(0, 8) + "...");
+console.log("🤖 Gemini model:", GEMINI_MODEL);
+console.log("🖼️ Serper key okundu:", SERPER_API_KEY.slice(0, 8) + "...");
 
 function setCorsHeaders(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-// ----------------------------------------------------------------
-// 🛠️ YARDIMCI FONKSİYONLAR
-// ----------------------------------------------------------------
+function json(res, status, data) {
+  if (res.writableEnded) return;
 
-function isImageUrl(url) {
-  if (typeof url !== "string") return false;
-  const cleanUrl = url.split('?')[0].toLowerCase();
-  return /\.(jpg|jpeg|png|webp)$/i.test(cleanUrl);
+  setCorsHeaders(res);
+  res.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+  });
+  res.end(JSON.stringify(data));
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk;
+
+      if (body.length > 1024 * 1024) {
+        reject(new Error("İstek gövdesi çok büyük."));
+        req.destroy();
+      }
+    });
+
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(body || "{}"));
+      } catch {
+        reject(new Error("İstek gövdesi geçerli JSON değil."));
+      }
+    });
+
+    req.on("error", reject);
+  });
+}
+
+function cleanText(value) {
+  return String(value || "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function cleanIsbn(value) {
+  return String(value || "").replace(/[^\dXx]/g, "").toUpperCase();
 }
 
 function convertIsbn13to10(isbn13) {
-  if (!isbn13 || isbn13.length !== 13 || !isbn13.startsWith("978")) return isbn13;
-  let s = isbn13.substring(3, 12);
-  let sum = 0;
-  for (let i = 0; i < 9; i++) {
-    sum += parseInt(s.charAt(i)) * (10 - i);
+  const clean = cleanIsbn(isbn13);
+
+  if (!clean || clean.length !== 13 || !clean.startsWith("978")) {
+    return clean;
   }
-  let z = (11 - (sum % 11)) % 11;
+
+  const s = clean.substring(3, 12);
+  let sum = 0;
+
+  for (let i = 0; i < 9; i++) {
+    sum += parseInt(s.charAt(i), 10) * (10 - i);
+  }
+
+  const z = (11 - (sum % 11)) % 11;
   return s + (z === 10 ? "X" : z.toString());
 }
 
-// URL Kontrolü (Resim var mı ve boyutu yeterli mi?)
-// 2KB altı resimler genellikle "Resim Yok" ikonudur.
-async function checkDirectUrl(url) {
+function isbnMatches(a, b) {
+  const x = cleanIsbn(a);
+  const y = cleanIsbn(b);
+
+  if (!x || !y) return false;
+  if (x === y) return true;
+
+  const x10 = convertIsbn13to10(x);
+  const y10 = convertIsbn13to10(y);
+
+  return x10 === y || y10 === x || x10 === y10;
+}
+
+function cleanJsonText(text) {
+  return String(text || "")
+    .replace(/```json/gi, "")
+    .replace(/```/g, "")
+    .trim();
+}
+
+function parseJsonFromText(text, fallbackValue) {
+  const cleaned = cleanJsonText(text);
+
   try {
-    const response = await axios.head(url, {
-      timeout: 2500,
-      validateStatus: (s) => s === 200,
+    return JSON.parse(cleaned);
+  } catch {}
+
+  try {
+    const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+    const objectMatch = cleaned.match(/\{[\s\S]*\}/);
+    const candidate = arrayMatch?.[0] || objectMatch?.[0];
+
+    if (candidate) {
+      return JSON.parse(candidate);
+    }
+  } catch {}
+
+  return fallbackValue;
+}
+
+function isImageUrl(url) {
+  if (typeof url !== "string") return false;
+
+  const cleanUrl = url.split("?")[0].toLowerCase();
+  return /\.(jpg|jpeg|png|webp)$/i.test(cleanUrl);
+}
+
+function isBadCoverUrl(url) {
+  if (!url) return true;
+
+  const lower = String(url).toLowerCase();
+
+  return (
+    lower.includes("gstatic.com") ||
+    lower.includes("google.com") ||
+    lower.includes("icon") ||
+    lower.includes("logo") ||
+    lower.includes("avatar") ||
+    lower.includes("placeholder") ||
+    lower.includes("no-image") ||
+    lower.includes("no_image") ||
+    lower.includes("no-photo") ||
+    lower.includes("no_photo") ||
+    lower.includes("sprite")
+  );
+}
+
+// ----------------------------------------------------------------
+// GEMINI
+// ----------------------------------------------------------------
+
+function extractGeminiText(data) {
+  const parts = data?.candidates?.[0]?.content?.parts;
+
+  if (!Array.isArray(parts)) return "";
+
+  return parts
+    .map((part) => {
+      if (typeof part?.text === "string") return part.text;
+      return "";
+    })
+    .join("")
+    .trim();
+}
+
+async function callGemini({
+  prompt,
+  temperature = 0.35,
+  googleSearch = true,
+}) {
+  async function sendRequest(useSearch) {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+    const body = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: prompt,
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature,
+      },
+    };
+
+    if (useSearch) {
+      body.tools = [
+        {
+          google_search: {},
+        },
+      ];
+    }
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+      },
+      body: JSON.stringify(body),
     });
-    return (
-      response.headers["content-length"] &&
-      parseInt(response.headers["content-length"]) > 2500
-    );
-  } catch (e) {
-    return false;
+
+    const rawText = await response.text();
+
+    let data = {};
+    try {
+      data = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      console.error("❌ Gemini JSON olmayan cevap döndürdü.");
+      console.error("HTTP Status:", response.status);
+      console.error("Raw cevap:", rawText.slice(0, 2000));
+      throw new Error(`Gemini geçerli JSON döndürmedi. HTTP: ${response.status}`);
+    }
+
+    if (!response.ok) {
+      console.error("❌ Gemini hata:", JSON.stringify(data, null, 2));
+      throw new Error(
+        data?.error?.message ||
+          data?.message ||
+          `Gemini hata: ${response.status}`
+      );
+    }
+
+    const text = extractGeminiText(data);
+
+    if (!text) {
+      console.error("❌ Gemini cevabı okunamadı:", JSON.stringify(data, null, 2));
+      throw new Error("Gemini cevabı okunamadı.");
+    }
+
+    return text;
+  }
+
+  try {
+    return await sendRequest(googleSearch);
+  } catch (error) {
+    if (googleSearch) {
+      console.warn(
+        "⚠️ Gemini google_search ile cevap alınamadı. Aramasız tekrar deneniyor..."
+      );
+      return await sendRequest(false);
+    }
+
+    throw error;
   }
 }
 
 // ----------------------------------------------------------------
-// 🎯 PROFESYONEL KAPAK BULMA STRATEJİSİ
-// Yanlış kitap gelmemesi için İSİM yerine ISBN odaklı çalışır.
+// SERPER IMAGES
 // ----------------------------------------------------------------
 
-async function findCoverStrategically(isbn) {
-  console.log(`🔍 Kapak Aranıyor (Sıfır Hata Modu): ${isbn}`);
+async function serperRequest(endpoint, payload) {
+  const response = await fetch(`https://google.serper.dev/${endpoint}`, {
+    method: "POST",
+    headers: {
+      "X-API-KEY": SERPER_API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
 
-  // --- 1. ADIM: DirectTextbook (Çok Yüksek Kalite - .webp) ---
-  try {
-      const dtUrl = `https://www.directtextbook.com/large/${isbn}.webp`;
-      if (await checkDirectUrl(dtUrl)) {
-          console.log(`✅ Kaynak: DirectTextbook`);
-          return dtUrl;
-      }
-  } catch (e) {}
+  const rawText = await response.text();
 
-  // --- 2. ADIM: ISBNSearch.org (HTML Scraping) ---
+  let data = {};
   try {
-    const { data: html } = await axios.get(`https://isbnsearch.org/isbn/${isbn}`, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
-      timeout: 4000
-    });
-    const match = html.match(/<div class="image">\s*<img src="([^"]+)"/i);
-    if (match && match[1] && await checkDirectUrl(match[1])) {
-        console.log(`✅ Kaynak: ISBNSearch`);
-        return match[1];
-    }
-  } catch (error) {}
+    data = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    console.error("❌ Serper JSON olmayan cevap:", rawText.slice(0, 1000));
+    throw new Error(`Serper geçerli JSON döndürmedi. HTTP: ${response.status}`);
+  }
 
-  // --- 3. ADIM: AbeBooks (Direct Link) ---
-  try {
-      const abebooksUrl = `https://pictures.abebooks.com/isbn/${isbn}-us-300.jpg`;
-      if (await checkDirectUrl(abebooksUrl)) {
-          console.log(`✅ Kaynak: AbeBooks`);
-          return abebooksUrl;
-      }
-  } catch (e) {}
+  if (!response.ok) {
+    console.error("❌ Serper hata:", JSON.stringify(data, null, 2));
+    throw new Error(data?.message || `Serper hata: ${response.status}`);
+  }
 
-  // --- 4. ADIM: Amazon (Direct Link) ---
-  try {
-      const isbn10 = convertIsbn13to10(isbn);
-      const amazonUrl = `http://images.amazon.com/images/P/${isbn10}.01.LZZZZZZZ.jpg`;
-      if (await checkDirectUrl(amazonUrl)) {
-          console.log(`✅ Kaynak: Amazon`);
-          return amazonUrl;
-      }
-  } catch (e) {}
+  return data;
+}
 
-  // --- 5. ADIM: GOOGLE GÖRSELLER (STRICT ISBN SEARCH) ---
-  // Yanlış kitap gelmemesi için SADECE ISBN ile arama yapıyoruz.
-  // Sorgu: "978605..." (Tırnak içinde tam eşleşme)
-  try {
-      console.log(`🔍 CDN'lerde yok, Google'da ISBN ile aranıyor...`);
-      const searchUrl = `https://www.google.com/search?q=${encodeURIComponent('"' + isbn + '"')}&tbm=isch`;
-      
-      const { data: html } = await axios.get(searchUrl, {
-          headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-          }
+async function serperImages(query, options = {}) {
+  return serperRequest("images", {
+    q: query,
+    gl: options.gl || "tr",
+    hl: options.hl || "tr",
+    num: options.num || 10,
+  });
+}
+
+function scoreCoverCandidate(item, { isbn, title, author }) {
+  const imageUrl = item.imageUrl || item.thumbnailUrl || item.image || item.url || "";
+  const meta = cleanText(
+    [
+      item.title,
+      item.source,
+      item.link,
+      item.domain,
+      imageUrl,
+      item.imageUrl,
+      item.thumbnailUrl,
+    ]
+      .filter(Boolean)
+      .join(" ")
+  ).toLowerCase();
+
+  let score = 0;
+
+  const clean = cleanIsbn(isbn);
+  const isbn10 = convertIsbn13to10(clean);
+
+  if (clean && meta.includes(clean.toLowerCase())) score += 80;
+  if (isbn10 && isbn10 !== clean && meta.includes(isbn10.toLowerCase())) score += 50;
+
+  const titleWords = cleanText(title)
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+
+  const authorWords = cleanText(author)
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+
+  for (const word of titleWords.slice(0, 5)) {
+    if (meta.includes(word)) score += 8;
+  }
+
+  for (const word of authorWords.slice(0, 4)) {
+    if (meta.includes(word)) score += 5;
+  }
+
+  if (isImageUrl(imageUrl)) score += 15;
+
+  if (meta.includes("kitap")) score += 5;
+  if (meta.includes("book")) score += 5;
+  if (meta.includes("cover")) score += 5;
+  if (meta.includes("kapak")) score += 5;
+
+  if (isBadCoverUrl(imageUrl)) score -= 100;
+
+  return score;
+}
+
+async function findCoverWithSerperImage({ isbn, title, author, publisher }) {
+  const clean = cleanIsbn(isbn);
+
+  const queries = [
+    `"${clean}" kitap kapağı`,
+    `"${clean}" book cover`,
+    `${title || ""} ${author || ""} kitap kapağı ${clean}`,
+    `${title || ""} ${author || ""} ${publisher || ""} kitap kapağı`,
+    `${title || ""} ${author || ""} book cover`,
+  ]
+    .map((q) => q.trim())
+    .filter(Boolean);
+
+  const seen = new Set();
+  const candidates = [];
+
+  for (const query of queries) {
+    try {
+      console.log("🖼️ Serper kapak araması:", query);
+
+      const data = await serperImages(query, {
+        gl: "tr",
+        hl: "tr",
+        num: 10,
       });
 
-      // Google JSON regex
-      const regex = /\["(https?:\/\/[^"]+)",(\d+),(\d+)\]/g;
-      let match;
+      const images = Array.isArray(data?.images) ? data.images : [];
 
-      while ((match = regex.exec(html)) !== null) {
-          let rawUrl = match[1];
-          try { rawUrl = JSON.parse(`"${rawUrl}"`); } catch (e) {}
+      for (const item of images) {
+        const imageUrl =
+          item.imageUrl ||
+          item.thumbnailUrl ||
+          item.image ||
+          item.url ||
+          "";
 
-          // Filtreleme: Google ikonlarını ve logolarını atla
-          if (rawUrl.includes('gstatic.com') || rawUrl.includes('google.com') || !rawUrl.startsWith('http')) continue;
-          if (rawUrl.includes('icon') || rawUrl.includes('logo') || rawUrl.includes('avatar')) continue;
-          
-          if (isImageUrl(rawUrl)) {
-              console.log(`✅ Kaynak: Google (ISBN Eşleşmesi): ${rawUrl}`);
-              return rawUrl;
-          }
+        if (!imageUrl) continue;
+        if (seen.has(imageUrl)) continue;
+        if (isBadCoverUrl(imageUrl)) continue;
+
+        seen.add(imageUrl);
+
+        candidates.push({
+          url: imageUrl,
+          score: scoreCoverCandidate(item, {
+            isbn: clean,
+            title,
+            author,
+          }),
+        });
       }
-  } catch (error) {}
+    } catch (error) {
+      console.warn("Serper kapak araması başarısız:", error.message);
+    }
+  }
 
-  // --- 6. SON ÇARE: Google Books Thumbnail (Küçük ama %100 Doğru) ---
-  console.log("⚠️ Hiçbir kaynakta HD bulunamadı, Google Books thumbnail dönülüyor.");
-  return `https://cdn.vectorstock.com/i/500p/33/47/no-photo-available-icon-vector-40343347.jpg`;
+  const sorted = candidates.sort((a, b) => b.score - a.score);
+
+  const bestDirectImage = sorted.find((x) => isImageUrl(x.url));
+  if (bestDirectImage) {
+    console.log("✅ Kapak kaynağı: Serper Images", bestDirectImage.url);
+    return bestDirectImage.url;
+  }
+
+  const bestAnyImage = sorted[0];
+  if (bestAnyImage?.url) {
+    console.log("✅ Kapak kaynağı: Serper Images fallback", bestAnyImage.url);
+    return bestAnyImage.url;
+  }
+
+  console.log("⚠️ Serper kapak bulamadı, varsayılan görsel dönülüyor.");
+  return NO_PHOTO_URL;
+}
+
+// Eski endpointlerde fonksiyon adı kullanılıyorsa bozulmasın diye korunuyor.
+async function findYandexImage(title, author) {
+  return findCoverWithSerperImage({
+    isbn: "",
+    title,
+    author,
+    publisher: "",
+  });
 }
 
 // ----------------------------------------------------------------
-// 🚀 SERVER REQUEST HANDLER
+// GEMINI İŞ FONKSİYONLARI
+// ----------------------------------------------------------------
+
+async function getBookByIsbnWithGemini(isbn) {
+  const clean = cleanIsbn(isbn);
+
+  const prompt = `
+Sen bir kitap veri asistanısın.
+
+Görevin verilen ISBN için Google Search kullanarak güvenilir kitap meta verisini bulmak ve sadece JSON döndürmektir.
+
+Çıktı formatı kesinlikle şu JSON olsun:
+
+{
+  "found": boolean,
+  "sourceIsbn": "Bulduğun gerçek ISBN veya null",
+  "title": "Kitap Adı",
+  "author": "Yazar Adı",
+  "publisher": "Yayınevi",
+  "pageCount": number,
+  "publishedDate": "Yıl",
+  "description": "2-4 cümlelik Türkçe kısa özet",
+  "categories": ["Kategori 1", "Kategori 2"]
+}
+
+Kurallar:
+- ISBN: ${clean}
+- Sadece bu ISBN ile birebir eşleşen kitap sonucunu kabul et.
+- ISBN alanında ${clean} açıkça görünmüyorsa found false döndür.
+- Emin değilsen tahmin etme.
+- Liste sayfası, blog başlığı, Reddit, YouTube veya genel öneri sayfasını kitap sanma.
+- Kapak görseli, link veya URL üretme. Kapak görseli başka sistem tarafından bulunacak.
+- Markdown kullanma.
+- JSON dışında hiçbir şey yazma.
+`.trim();
+
+  const text = await callGemini({
+    prompt,
+    temperature: 0,
+    googleSearch: true,
+  });
+
+  return parseJsonFromText(text, { found: false });
+}
+
+async function getReadingAdviceWithGemini(payload) {
+  const {
+    goal,
+    mood,
+    availableMinutes,
+    preferenceText,
+    tone,
+    summary,
+    sampleBooks,
+    readerProfile,
+    candidateBooks,
+  } = payload || {};
+
+  const sectionTitle =
+    goal === "choose_new_book"
+      ? "Satın Alabileceğin Öneriler"
+      : "Kesinlikle Başlaman Gerekenler";
+
+  const prompt = `
+Sen kişisel bir okuma asistanısın.
+
+Kullanıcının kütüphanesindeki kitapları, okuma hızını, ruh halini, favori kategorilerini ve aday kitaplarını analiz et.
+Gerekirse Google Search kullanarak kitapların yazar, yayınevi, sayfa sayısı, türü ve kısa konusu hakkında bilgi edin.
+
+Kullanıcı verisi:
+${JSON.stringify(
+  {
+    goal,
+    mood,
+    availableMinutes,
+    preferenceText,
+    tone,
+    summary,
+    sampleBooks,
+    readerProfile,
+    candidateBooks: Array.isArray(candidateBooks) ? candidateBooks : [],
+  },
+  null,
+  2
+)}
+
+Çıktıyı SADECE şu başlıklarla ver:
+
+1) Kısa Profil Özeti
+- Kısa ve net maddeler yaz.
+
+2) Öneri Stratejisi
+- Kısa ve net maddeler yaz.
+
+3) ${sectionTitle}
+Her öneriyi kesinlikle şu tek satır formatında yaz:
+
+- Kitap: Kitap adı | Yazar: Yazar adı | Yayinevi: Yayınevi adı veya Bilinmiyor | Sayfa: sayı veya Bilinmiyor | Tur: tür/kategori | Ozet: 1 kısa cümle | Neden: Bu kullanıcıya neden uygun olduğunu kısa açıkla.
+
+4) Kendimi Şanslı Hissediyorum
+- Kitap: Tek kitap adı | Yazar: Yazar adı | Yayinevi: Yayınevi adı veya Bilinmiyor | Sayfa: sayı veya Bilinmiyor | Tur: tür/kategori | Ozet: 1 kısa cümle | Neden: Bugün neden bu kitap seçilmeli.
+
+Kurallar:
+- Genel liste başlıklarını kitap sanma. Örnek: “En iyi 100 kitap”, “Kitap önerileri listesi”, Reddit başlığı, YouTube başlığı kitap değildir.
+- Gerçek kitap adı ve gerçek yazar adı ver.
+- Yayınevi biliniyorsa mutlaka Yayinevi alanına yaz.
+- Sayfa sayısı biliniyorsa mutlaka Sayfa alanına yaz.
+- Her kitap tek madde olsun.
+- Sayfa, yayınevi, özet, tür, neden gibi detayları ayrı satıra bölme.
+- Alan adlarını aynen şu şekilde yaz: Kitap, Yazar, Yayinevi, Sayfa, Tur, Ozet, Neden.
+- JSON verme.
+- Markdown tablo verme.
+- Uzun paragraf yazma.
+- Kullanıcıya "sen" diye hitap et.
+- Ton: ${tone || "motive"}.
+`.trim();
+
+  return callGemini({
+    prompt,
+    temperature: 0.35,
+    googleSearch: true,
+  });
+}
+
+async function getRecommendationsWithGemini({
+  favoriteAuthors,
+  favoriteGenres,
+  recentBooks,
+}) {
+  const prompt = `
+Sen uzman bir kitap küratörüsün.
+
+Kullanıcının sevdiği yazarlar, türler ve son okuduğu kitaplara göre Google Search kullanarak 3 gerçek kitap öner.
+
+Kullanıcı profili:
+${JSON.stringify(
+  {
+    favoriteAuthors: Array.isArray(favoriteAuthors) ? favoriteAuthors : [],
+    favoriteGenres: Array.isArray(favoriteGenres) ? favoriteGenres : [],
+    recentBooks: Array.isArray(recentBooks) ? recentBooks : [],
+  },
+  null,
+  2
+)}
+
+Sadece JSON array döndür:
+
+[
+  {
+    "title": "Kitap Adı",
+    "author": "Yazar Adı",
+    "publisher": "Yayınevi veya Bilinmiyor",
+    "pageCount": 0,
+    "genre": "Tür/Kategori",
+    "summary": "Kısa özet",
+    "reason": "Bu kullanıcıya neden uygun olduğunu kısa açıkla."
+  }
+]
+
+Kurallar:
+- Genel liste başlıklarını kitap sanma.
+- “En iyi 100 kitap”, “Elinizden düşürmeyeceğiniz 100 kitap önerisi”, Reddit başlığı, YouTube başlığı, blog başlığı öneri değildir.
+- Gerçek kitap adı ve gerçek yazar adı ver.
+- Son okudukları listesindeki kitapları önerme.
+- Türkçeye çevrilmiş veya Türkçe yazılmış kitapları tercih et.
+- Yayınevi ve sayfa sayısını bulabilirsen doldur.
+- Bulamadığın yayınevi için "Bilinmiyor" yaz.
+- Bulamadığın sayfa sayısı için 0 yaz.
+- Markdown kullanma.
+- JSON dışında hiçbir şey yazma.
+`.trim();
+
+  const text = await callGemini({
+    prompt,
+    temperature: 0.45,
+    googleSearch: true,
+  });
+
+  const parsed = parseJsonFromText(text, []);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+// ----------------------------------------------------------------
+// SERVER
 // ----------------------------------------------------------------
 
 const server = http.createServer((req, res) => {
@@ -155,567 +659,220 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-// ---------------------------------------------
-// AI ile ISBN → kitap bilgisi alan endpoint
-// ---------------------------------------------
-if (req.method === "POST" && req.url === "/api/books/ai") {
-  let body = "";
+  if (req.method === "GET" && req.url === "/") {
+    return json(res, 200, {
+      ok: true,
+      message: "Backend çalışıyor.",
+      ai: "Gemini",
+      cover: "Serper Images",
+      model: GEMINI_MODEL,
+    });
+  }
 
-  req.on("data", (chunk) => {
-    body += chunk;
-  });
-
-  req.on("end", () => {
+  if (req.method === "POST" && req.url === "/api/books/ai") {
     (async () => {
       try {
-        setCorsHeaders(res);
-
-        // ---- ISBN'i body'den al ----
-        let isbn = "";
-        try {
-          const parsed = JSON.parse(body || "{}");
-          isbn = (parsed.isbn || "").toString().trim();
-        } catch (e) {}
+        const parsed = await readBody(req);
+        const isbn = (parsed.isbn || "").toString().trim();
 
         if (!isbn) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({ found: false, message: "ISBN eksik." })
-          );
-          return;
+          return json(res, 400, {
+            found: false,
+            message: "ISBN eksik.",
+          });
         }
 
-        console.log("📚 Gelen ISBN:", isbn);
+        const clean = cleanIsbn(isbn);
 
-        // Sadece rakam ve X/x bırak
-        const cleanIsbn = isbn.replace(/[^\dXx]/g, "");
-        const promptIsbn = cleanIsbn || isbn;
-
-        // -----------------------------
-        // 1. ADIM: OpenAI'den kitap meta verisi
-        // -----------------------------
-        const openaiRes = await fetch(
-          "https://api.openai.com/v1/responses",
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${OPENAI_API_KEY}`,
-            },
-            body: JSON.stringify({
-              model: "gpt-4o-mini",
-              tools: [{ type: "web_search" }],
-              temperature: 0, // tahmin güdüsünü azalt
-              input: [
-                {
-                  type: "message",
-                  role: "system",
-                  content: [
-                    {
-                      type: "input_text",
-                      text: `
-Sen bir “kitap veri asistanısın”.
-
-Görevin, sana verilen ISBN numarasına göre **sadece kitap meta verilerini** üretmek ve sonucu **yalnızca geçerli JSON** olarak döndürmektir.
-
-Çıktı formatın tam olarak şu yapıda olmalı:
-
-{
-  "found": boolean,
-  "sourceIsbn": "Bulduğun kaynaktaki gerçek ISBN veya null",
-  "title": "Kitap Adı",
-  "author": "Yazar Adı",
-  "publisher": "Yayınevi Adı",
-  "pageCount": number,
-  "publishedDate": "Yıl",
-  "description": "Kısa özet",
-  "categories": ["Kategori 1", "Kategori 2"]
-}
-
-ÖNEMLİ ISBN KURALLARI:
-
-- Sana verilecek ISBN şudur: ${promptIsbn}
-- Web araması yaparken SADECE bu ISBN ile birebir eşleşen kitapları kullan.
-- ISBN alanında ${promptIsbn} NUMARASINI AÇIKÇA GÖSTERMeyen hiçbir sonucu KABUL ETME.
-- ISBN tam olarak eşleşmiyorsa "found": false ve "sourceIsbn": null döndür.
-- Emin OLAMAZSAN, TAHMİN ETME → "found": false döndür.
-
-Açıklamalar:
-
-- "found":
-  - Kitap bulunduysa true, bulunamadıysa false olmalı.
-
-- "sourceIsbn":
-  - İnternette gördüğün, "ISBN" alanındaki gerçek değeri yaz.
-  - Eğer bulamazsan veya emin değilsen null kullan.
-
-- "title", "author", "publisher":
-  - Mümkünse Türkçe karşılıklarıyla doldur. Eğer kitap Türkiye'de yayımlanmışsa, Türkçe adı ve yayınevini bulmaya çalış.
-  - Eğer sadece orijinal dilde bulabiliyorsan, orijinal başlığı ve yazarı kullan.
-
-- "pageCount":
-  - Sadece sayı olmalı (örnek: 320). Bilinmiyorsa null kullan.
-
-- "publishedDate":
-  - Sadece yılı string olarak döndür (örnek: "2014").
-
-- "description":
-  - Kitabın kısa bir özetini içermeli (2–4 cümle).
-  - Mümkün olduğunca Türkçe yaz.
-
-- "categories":
-  - "Kişisel Gelişim", "Bilim Kurgu", "Fantastik", "Psikoloji", "Tarih" vb. kategori isimlerinden oluşan bir dizi.
-  - Kategoriler yoksa boş dizi döndür: [].
-
-Kesin Kurallar:
-
-1. Kapak görseli, link, URL veya görsel kaynağı ASLA üretme.
-2. JSON dışına ÇIKMA:
-   - JSON’dan önce veya sonra hiçbir açıklama, yorum, metin, markdown veya uyarı yazma.
-   - Sadece tek bir JSON nesnesi döndür.
-3. JSON geçerli olmalı:
-   - Tüm alan adları ve string değerler çift tırnak içinde olmalı.
-   - Fazladan virgül, yorum, vs. olmamalı.
-
-Özet:
-Sana bir ISBN verilecek (ISBN: ${promptIsbn}) ve sen de sadece yukarıdaki şemaya tamamen uyan temiz, doğru ve geçerli tek bir JSON cevabı döndüreceksin. Başka hiçbir şey yazmayacaksın.
-                      `.trim(),
-                    },
-                  ],
-                },
-                {
-                  type: "message",
-                  role: "user",
-                  content: [
-                    {
-                      type: "input_text",
-                      text: `Lütfen sadece ISBN ${promptIsbn} için meta veriyi döndür.`,
-                    },
-                  ],
-                },
-              ],
-            }),
-          }
-        );
-
-        const openaiJson = await openaiRes.json();
-        if (!openaiRes.ok) {
-          console.error("❌ OpenAI /api/books/ai hata:", openaiJson);
-          throw new Error(
-            openaiJson?.error?.message ||
-              `OpenAI hata: ${openaiRes.status}`
-          );
+        if (!clean) {
+          return json(res, 400, {
+            found: false,
+            message: "Geçerli ISBN girilmedi.",
+          });
         }
 
-        // responses API'den assistant text'i çek
-        let text = "";
-        const outputItems = Array.isArray(openaiJson.output)
-          ? openaiJson.output
-          : [];
-        const messageItem =
-          outputItems.find(
-            (item) =>
-              item.type === "message" && item.role === "assistant"
-          ) || outputItems[0];
+        console.log("📚 Gelen ISBN:", clean);
 
-        if (
-          messageItem &&
-          Array.isArray(messageItem.content) &&
-          messageItem.content.length > 0
-        ) {
-          const textPart = messageItem.content.find(
-            (c) => c.type === "output_text"
-          );
-          if (textPart && typeof textPart.text === "string") {
-            text = textPart.text.trim();
-          }
-        }
+        const book = await getBookByIsbnWithGemini(clean);
 
-        // JSON'a çevir
-        let book = {};
-        try {
-          const cleaned = text
-            .replace(/```json/gi, "")
-            .replace(/```/g, "")
-            .trim();
-          book = JSON.parse(cleaned || "{}");
-        } catch (e) {
-          console.error("JSON Parse Error (ISBN):", e);
-        }
-
-        // ---------- EK GÜVENLİK: ISBN EŞLEŞMESİ ----------
         const sourceIsbnRaw =
-          typeof book.sourceIsbn === "string" ? book.sourceIsbn : "";
-        const sourceIsbnClean = sourceIsbnRaw.replace(/[^\dXx]/g, "");
-        const isbnMatches =
-          sourceIsbnClean &&
-          sourceIsbnClean.length >= 10 &&
-          sourceIsbnClean === cleanIsbn;
+          typeof book.sourceIsbn === "string" ||
+          typeof book.sourceIsbn === "number"
+            ? String(book.sourceIsbn)
+            : "";
 
-        if (!book.found || !isbnMatches) {
-          console.warn(
-            "⚠️ AI kitap bulamadı veya ISBN tam eşleşmedi. Güvenli şekilde boş dönülüyor.",
-            { promptIsbn, sourceIsbnRaw }
-          );
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              found: false,
-              message:
-                "Bu ISBN için güvenilir bir kayıt bulunamadı. Bilgileri manuel girebilirsin.",
-            })
-          );
-          return;
+        const match = isbnMatches(clean, sourceIsbnRaw);
+
+        if (!book?.found || !match) {
+          console.warn("⚠️ Gemini kitap bulamadı veya ISBN eşleşmedi.", {
+            clean,
+            sourceIsbnRaw,
+          });
+
+          return json(res, 200, {
+            found: false,
+            message:
+              "Bu ISBN için güvenilir bir kayıt bulunamadı. Bilgileri manuel girebilirsin.",
+          });
         }
 
-        // -------------------------------
-        // 2. ADIM: KAPAK BULMA
-        // 📌 Senin algoritmana HİÇ dokunmuyoruz
-        // -------------------------------
-        let finalCoverUrl = null;
+        let finalCoverUrl = NO_PHOTO_URL;
+
         try {
-          // BURADA SADECE cleanIsbn kullanıyoruz, senin önceki çağrın nasılsa öyle kalsın
-          finalCoverUrl = await findCoverStrategically(cleanIsbn);
-        } catch (e) {
-          console.error("Kapak bulma hatası:", e);
+          finalCoverUrl = await findCoverWithSerperImage({
+            isbn: clean,
+            title: book.title,
+            author: book.author,
+            publisher: book.publisher,
+          });
+        } catch (error) {
+          console.warn("Serper kapak arama hatası:", error.message);
+          finalCoverUrl = NO_PHOTO_URL;
         }
 
-        // 🔥 KATEGORİLERİ GÜVENLİ ŞEKİLDE AL
         const normalizedCategories = Array.isArray(book.categories)
           ? book.categories
-              .filter(
-                (c) => typeof c === "string" && c.trim() !== ""
-              )
+              .filter((c) => typeof c === "string" && c.trim() !== "")
               .map((c) => c.trim())
           : [];
 
-        // 👉 FRONTEND'E GİDEN YAPI (HİÇ DEĞİŞMEDİ)
         const normalized = {
           found: true,
           title: book.title || null,
           author: book.author || null,
           publisher: book.publisher || null,
-          pageCount: book.pageCount
-            ? Number(book.pageCount)
-            : null,
+          pageCount:
+            book.pageCount !== undefined &&
+            book.pageCount !== null &&
+            Number.isFinite(Number(book.pageCount))
+              ? Number(book.pageCount)
+              : null,
           publishedDate: book.publishedDate || null,
           description: book.description || null,
-          coverImageUrl: finalCoverUrl,
+          coverImageUrl: finalCoverUrl || NO_PHOTO_URL,
           categories: normalizedCategories,
         };
 
         console.log("✅ ISBN yanıtı:", normalized.title);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(normalized));
+        console.log("🖼️ Kapak URL:", normalized.coverImageUrl);
+
+        return json(res, 200, normalized);
       } catch (err) {
         console.error("💥 /api/books/ai hata:", err);
-        setCorsHeaders(res);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            found: false,
-            message:
-              err?.message ||
-              "Sunucu tarafında bir hata oluştu (ISBN AI).",
-          })
-        );
+
+        return json(res, 500, {
+          found: false,
+          message:
+            err?.message ||
+            "Sunucu tarafında bir hata oluştu (ISBN Gemini + Serper).",
+        });
       }
     })();
-  });
 
-  return;
-}
+    return;
+  }
 
-
-  // ---------------------------------------------
-// 2) OKUMA ÖNERİSİ ENDPOINTİ  /api/ai/recommend
-// ---------------------------------------------
-if (req.method === "POST" && req.url === "/api/ai/recommend") {
-  let body = "";
-
-  req.on("data", (chunk) => {
-    body += chunk;
-  });
-
-  req.on("end", () => {
+  if (req.method === "POST" && req.url === "/api/ai/recommend") {
     (async () => {
       try {
-        setCorsHeaders(res);
+        const payload = await readBody(req);
 
-        let payload;
-        try {
-          payload = JSON.parse(body || "{}");
-        } catch (e) {
-          console.error("JSON parse hatası /ai/recommend:", e);
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              text: "İstek gövdesi (body) geçerli JSON formatında değil.",
-            })
-          );
-          return;
-        }
+        const text = await getReadingAdviceWithGemini(payload);
 
-        const {
-          goal,              // "choose_library_book" | "choose_new_book"
-          mood,
-          availableMinutes,
-          preferenceText,
-          tone,              // "motive" | "calm" | "direct"
-          summary,           // kütüphane özeti string
-          sampleBooks,       // kısa liste
-          readerProfile,     // { avgPagesPerDay, favCategories, ... }
-          candidateBooks,    // kütüphaneden okunacak/okunuyor kitaplar
-        } = payload || {};
-
-        const safeCandidateBooks = Array.isArray(candidateBooks)
-          ? candidateBooks
-          : [];
-
-        // -------- SYSTEM PROMPT (Zekânın Beyni) --------
-        const systemPrompt = `
-Sen kişisel bir okuma asistanısın.
-
-Görevin:
-- Kullanıcının kendi KÜTÜPHANESİNDEKİ kitapları ve okuma geçmişini analiz et.
-- Gerekirse tools.web_search ile internette araştırma yap:
-  * Daha önce okuduğu kitapların konularını, türlerini, temasını öğren.
-  * "candidateBooks" listesindeki (OKUNACAK / OKUNUYOR) kitapları da araştır.
-- Sonra bu bilgileri birleştirerek,
-  1) Kütüphanesinden "kesinlikle başlaması gereken" kitapları seç
-  2) İsterse yeni alacağı kitaplar için de öneriler üret.
-
-goal alanı:
-- "choose_library_book":
-    * Kütüphanedeki candidateBooks listesinden 1–3 adet kitabı
-      "Kesinlikle başlamalısın" seviyesinde önceliklendir.
-    * Neden bu kitapları önerdiğini ayrıntılı anlat:
-      - Daha önce severek okuduğu kitaplarla tematik benzerlik
-      - Okuma hızı ve toplam sayfa uyumu
-      - Kategoriler, puanlar (expected / final / overall rating)
-      - Ruh hali (mood) ve bugün ayırabileceği süre (availableMinutes)
-    * Ayrıca "kendimi şanslı hissediyorum" tarzında TEK bir kitap seç:
-      - Bu kitabı özel olarak "Bugün şansını bu kitapla dene" gibi vurgula.
-
-- "choose_new_book":
-    * Kullanıcının KÜTÜPHANE PROFİLİNİ (summary, sampleBooks, readerProfile)
-      temel alarak, dışarıdan satın alabileceği 3–5 kitap öner:
-      - Kitap adını ve yazarı net yaz
-      - Tür / tema / his
-      - Neden bu kullanıcıya uyuyor (önceki okuduğu kitaplar ve favori kategorilere göre)
-    * Çok popüler, klişe önerilere boğma; ama tamamen bilinmeyen kitaplardan da kaçın.
-    * İstersen, bir tanesini "Şanslı öneri" gibi özellikle öne çıkar.
-
-Stil:
-- Çıktıyı SADECE normal Türkçe metin olarak ver (JSON verme, kod bloğu kullanma).
-- Aşağıdaki gibi bölümlere ayrıştır:
-  1) Kısa profil özeti (okuma hızı, sevilen kategoriler)
-  2) Öneri stratejin (neden böyle seçtin)
-  3) "Kesinlikle başlaman gerekenler" veya "Satın alman için öneriler" listesi
-  4) "Kendimi şanslı hissediyorum" için TEK bir kitap öner (kitap adını net yaz).
-
-tone:
-- "motive": motive edici, sıcak, hafif koçluk yapar gibi
-- "calm": sakin, açıklayıcı, yumuşak
-- "direct": kısa, net, lafı dolandırmadan
-- Kullanıcıya "sen" diye hitap et.
-`.trim();
-
-        const userContent = {
-          goal,
-          mood,
-          availableMinutes,
-          preferenceText,
-          summary,
-          sampleBooks,
-          readerProfile,
-          candidateBooks: safeCandidateBooks,
-        };
-
-        const openaiRes = await fetch("https://api.openai.com/v1/responses", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-          },
-          body: JSON.stringify({
-            model: "gpt-4o-mini",
-            tools: [{ type: "web_search" }],
-            input: [
-              {
-                type: "message",
-                role: "system",
-                content: [
-                  {
-                    type: "input_text",
-                    text: systemPrompt,
-                  },
-                ],
-              },
-              {
-                type: "message",
-                role: "user",
-                content: [
-                  {
-                    type: "input_text",
-                    text: JSON.stringify(userContent, null, 2),
-                  },
-                ],
-              },
-            ],
-          }),
+        return json(res, 200, {
+          text:
+            text ||
+            "Şu anda yeterli veri bulamadım, ama kütüphanendeki kitapları biraz daha doldurduğunda daha net öneriler yapabilirim.",
         });
-
-        const openaiJson = await openaiRes.json();
-        if (!openaiRes.ok) {
-          console.error("❌ OpenAI /ai/recommend hata:", openaiJson);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(
-            JSON.stringify({
-              text:
-                openaiJson?.error?.message ||
-                `OpenAI hata: ${openaiRes.status}`,
-            })
-          );
-          return;
-        }
-
-        // output_text'ten metni çek
-        let aiText = "";
-        const outputItems = Array.isArray(openaiJson.output)
-          ? openaiJson.output
-          : [];
-        const messageItem =
-          outputItems.find(
-            (item) =>
-              item.type === "message" && item.role === "assistant"
-          ) || outputItems[0];
-
-        if (
-          messageItem &&
-          Array.isArray(messageItem.content) &&
-          messageItem.content.length > 0
-        ) {
-          const textPart = messageItem.content.find(
-            (c) => c.type === "output_text"
-          );
-          if (textPart && typeof textPart.text === "string") {
-            aiText = textPart.text.trim();
-          }
-        }
-
-        if (!aiText) {
-          aiText =
-            "Şu anda yeterli veri bulamadım, ama kütüphanendeki kitapları biraz daha doldurduğunda çok daha net öneriler yapabilirim.";
-        }
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ text: aiText }));
       } catch (err) {
-        console.error("💥 /api/ai/recommend sunucu hatası:", err);
-        setCorsHeaders(res);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(
-          JSON.stringify({
-            text: "Sunucu tarafında bir hata oluştu (ai recommend).",
-          })
-        );
+        console.error("💥 /api/ai/recommend hata:", err);
+
+        return json(res, 500, {
+          text:
+            err?.message ||
+            "Sunucu tarafında bir hata oluştu (Gemini recommend).",
+        });
       }
     })();
-  });
 
-  return;
-}
+    return;
+  }
 
+  const baseURL = "http://" + req.headers.host + "/";
+  const myUrl = new URL(req.url, baseURL);
 
+  if (req.method === "POST" && myUrl.pathname === "/api/recommendations") {
+    (async () => {
+      try {
+        const payload = await readBody(req);
+
+        const favoriteAuthors = Array.isArray(payload.favoriteAuthors)
+          ? payload.favoriteAuthors
+          : [];
+
+        const favoriteGenres = Array.isArray(payload.favoriteGenres)
+          ? payload.favoriteGenres
+          : [];
+
+        const recentBooks = Array.isArray(payload.recentBooks)
+          ? payload.recentBooks
+          : [];
+
+        const suggestions = await getRecommendationsWithGemini({
+          favoriteAuthors,
+          favoriteGenres,
+          recentBooks,
+        });
+
+        const suggestionsWithCovers = await Promise.all(
+          suggestions.slice(0, 3).map(async (book) => {
+            const coverUrl = await findCoverWithSerperImage({
+              isbn: "",
+              title: book.title,
+              author: book.author,
+              publisher: book.publisher,
+            });
+
+            return {
+              title: book.title || "",
+              author: book.author || "Bilinmiyor",
+              publisher: book.publisher || "Bilinmiyor",
+              pageCount:
+                book.pageCount !== undefined &&
+                book.pageCount !== null &&
+                Number.isFinite(Number(book.pageCount))
+                  ? Number(book.pageCount)
+                  : 0,
+              genre: book.genre || "",
+              summary: book.summary || "",
+              reason: book.reason || "",
+              coverUrl,
+            };
+          })
+        );
+
+        return json(res, 200, {
+          success: true,
+          data: suggestionsWithCovers,
+        });
+      } catch (err) {
+        console.error("Öneri Hatası:", err.message);
+
+        return json(res, 500, {
+          error: err.message,
+        });
+      }
+    })();
+
+    return;
+  }
 
   setCorsHeaders(res);
   res.writeHead(404, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ error: "Not found" }));
 });
 
-// ----------------------------------------------------------------
-// 🌟 [YENİ] AI KİTAP ÖNERİ ENDPOINT'İ
-// Kullanıcının sevdiği tür ve yazarlara göre öneri üretir.
-// ----------------------------------------------------------------
-server.on('request', async (req, res) => {
-  const baseURL = 'http://' + req.headers.host + '/';
-  const myUrl = new URL(req.url, baseURL);
-
-  if (req.method === "POST" && myUrl.pathname === "/api/recommendations") {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk; });
-
-    req.on("end", () => {
-      (async () => {
-        try {
-          setCorsHeaders(res);
-          const { favoriteAuthors, favoriteGenres, recentBooks } = JSON.parse(body || "{}");
-
-          console.log("🤖 AI Öneri İsteği:", { favoriteGenres, favoriteAuthors });
-
-          const prompt = `
-            Kullanıcı Profili:
-            - Sevdiği Yazarlar: ${favoriteAuthors?.join(", ") || "Belirtilmemiş"}
-            - Sevdiği Türler: ${favoriteGenres?.join(", ") || "Genel Edebiyat"}
-            - Son Okudukları: ${recentBooks?.join(", ") || "Yok"}
-
-            GÖREV:
-            Bu kullanıcı için zevkine uygun, Türkçeye çevrilmiş veya Türkçe yazılmış 3 adet kitap öner.
-            
-            KURALLAR:
-            1. "Son Okudukları" listesindeki kitapları ASLA önerme.
-            2. Her öneri için kısa ve cezbedici bir "Neden?" açıklaması yaz.
-            3. Çıktıyı sadece aşağıdaki JSON formatında ver (Markdown yok):
-            
-            [
-              {
-                "title": "Kitap Adı",
-                "author": "Yazar Adı",
-                "reason": "Çünkü X yazarını seviyorsun ve Y türündeki bu kitap..."
-              }
-            ]
-          `;
-
-          const openaiRes = await axios.post("https://api.openai.com/v1/chat/completions", {
-             model: "gpt-4o-mini",
-             messages: [
-                 { role: "system", content: "Sen uzman bir edebiyat eleştirmeni ve kitap küratörüsün. Sadece JSON döndür." },
-                 { role: "user", content: prompt }
-             ],
-             temperature: 0.7
-          }, {
-             headers: { 
-                 "Content-Type": "application/json",
-                 "Authorization": `Bearer ${OPENAI_API_KEY}` 
-             }
-          });
-
-          const content = openaiRes.data.choices[0].message.content;
-          const cleanJson = content.replace(/```json|```/g, "").trim();
-          const suggestions = JSON.parse(cleanJson);
-
-          // Her öneri için kapak resmi bul (Senin Yandex algoritmanı kullanıyoruz)
-          const suggestionsWithCovers = await Promise.all(suggestions.map(async (book) => {
-              const coverUrl = await findYandexImage(book.title, book.author);
-              return { ...book, coverUrl };
-          }));
-
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ success: true, data: suggestionsWithCovers }));
-
-        } catch (err) {
-          console.error("Öneri Hatası:", err.message);
-          setCorsHeaders(res);
-          res.writeHead(500);
-          res.end(JSON.stringify({ error: err.message }));
-        }
-      })();
-    });
-    return;
-  }
-});
-
 server.listen(PORT, () => {
   console.log(`📡 Backend http://localhost:${PORT} üzerinde çalışıyor`);
+  console.log("🔎 Mod: Gemini + Serper Images");
 });
