@@ -1,8 +1,9 @@
 // backend/server.js
 // Node 18+ gerektirir.
-// ISBN veri kaynağı: Google Books + Open Library
-// Eksik özet/kategori zenginleştirme: Gemini
-// Kapak görseli: Serper Images API
+// ISBN seed: Serper Images
+// Kitap detayları: Gemini
+// Kapak görseli: Serper Images
+// OpenAI / OpenRouter yoktur.
 
 const path = require("path");
 
@@ -96,10 +97,6 @@ function cleanIsbn(value) {
   return String(value || "").replace(/[^\dXx]/g, "").toUpperCase();
 }
 
-function normalizeIsbnForCompare(value) {
-  return cleanIsbn(value);
-}
-
 function convertIsbn13to10(isbn13) {
   const clean = cleanIsbn(isbn13);
 
@@ -116,19 +113,6 @@ function convertIsbn13to10(isbn13) {
 
   const z = (11 - (sum % 11)) % 11;
   return s + (z === 10 ? "X" : z.toString());
-}
-
-function isbnMatches(a, b) {
-  const x = cleanIsbn(a);
-  const y = cleanIsbn(b);
-
-  if (!x || !y) return false;
-  if (x === y) return true;
-
-  const x10 = convertIsbn13to10(x);
-  const y10 = convertIsbn13to10(y);
-
-  return x10 === y || y10 === x || x10 === y10;
 }
 
 function cleanJsonText(text) {
@@ -158,6 +142,18 @@ function parseJsonFromText(text, fallbackValue) {
   return fallbackValue;
 }
 
+function parseNumberOrNull(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+
+  const match = String(value || "").match(/\d{1,5}/);
+  if (!match) return null;
+
+  const n = Number(match[0]);
+  if (!Number.isFinite(n) || n <= 0 || n > 5000) return null;
+
+  return n;
+}
+
 function isImageUrl(url) {
   if (typeof url !== "string") return false;
 
@@ -185,22 +181,12 @@ function isBadCoverUrl(url) {
   );
 }
 
-async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
-  const rawText = await response.text();
-
-  let data = {};
-  try {
-    data = rawText ? JSON.parse(rawText) : {};
-  } catch {
-    throw new Error(`JSON okunamadı. HTTP: ${response.status}`);
-  }
-
-  if (!response.ok) {
-    throw new Error(`İstek başarısız. HTTP: ${response.status}`);
-  }
-
-  return data;
+function cleanSeedTitle(title) {
+  return cleanText(title)
+    .replace(/\s+\|\s+.*$/g, "")
+    .replace(/\s+-\s+(Kitapyurdu|D&R|İdefix|Amazon|BKM Kitap|NadirKitap|Pandora).*$/gi, "")
+    .replace(/\s*Kitap\s*$/gi, "")
+    .trim();
 }
 
 // ----------------------------------------------------------------
@@ -308,7 +294,7 @@ async function callGemini({
 }
 
 // ----------------------------------------------------------------
-// SERPER IMAGES
+// SERPER
 // ----------------------------------------------------------------
 
 async function serperRequest(endpoint, payload) {
@@ -346,6 +332,131 @@ async function serperImages(query, options = {}) {
     hl: options.hl || "tr",
     num: options.num || 10,
   });
+}
+
+function pickBestSerperImageResult(images) {
+  if (!Array.isArray(images) || images.length === 0) return null;
+
+  const goodSources = [
+    "kitapyurdu",
+    "dr.com.tr",
+    "d&r",
+    "idefix",
+    "bkmkitap",
+    "amazon",
+    "penguenkitap",
+    "kidega",
+    "nadirkitap",
+    "pandora",
+    "hepsiburada",
+  ];
+
+  const scored = images
+    .map((item) => {
+      const imageUrl =
+        item.imageUrl ||
+        item.thumbnailUrl ||
+        item.image ||
+        item.url ||
+        "";
+
+      const meta = cleanText(
+        [
+          item.title,
+          item.source,
+          item.domain,
+          item.link,
+          imageUrl,
+        ]
+          .filter(Boolean)
+          .join(" ")
+      ).toLowerCase();
+
+      let score = 0;
+
+      if (item.position) score += Math.max(0, 25 - Number(item.position));
+      if (item.title && item.title.trim().length > 3) score += 35;
+      if (imageUrl && !isBadCoverUrl(imageUrl)) score += 30;
+      if (isImageUrl(imageUrl)) score += 10;
+
+      for (const source of goodSources) {
+        if (meta.includes(source)) score += 25;
+      }
+
+      if (meta.includes("kitap")) score += 8;
+      if (meta.includes("book")) score += 8;
+      if (meta.includes("kapak")) score += 8;
+      if (meta.includes("cover")) score += 8;
+
+      if (isBadCoverUrl(imageUrl)) score -= 120;
+
+      return {
+        item,
+        imageUrl,
+        score,
+      };
+    })
+    .filter((x) => x.imageUrl && !isBadCoverUrl(x.imageUrl))
+    .sort((a, b) => b.score - a.score);
+
+  return scored[0]?.item || null;
+}
+
+async function findBookSeedFromSerperImage(isbn) {
+  const clean = cleanIsbn(isbn);
+
+  const queries = [
+    `ISBN:${clean}`,
+    `"ISBN:${clean}"`,
+    `"${clean}" kitap kapağı`,
+  ];
+
+  for (const query of queries) {
+    try {
+      console.log("🖼️ Serper ISBN görsel araması:", query);
+
+      const data = await serperImages(query, {
+        gl: "tr",
+        hl: "tr",
+        num: 10,
+      });
+
+      const images = Array.isArray(data?.images) ? data.images : [];
+      const best = pickBestSerperImageResult(images);
+
+      if (!best) continue;
+
+      const imageUrl =
+        best.imageUrl ||
+        best.thumbnailUrl ||
+        best.image ||
+        best.url ||
+        "";
+
+      const title = cleanSeedTitle(best.title || "");
+
+      if (!title || !imageUrl || isBadCoverUrl(imageUrl)) continue;
+
+      return {
+        found: true,
+        isbn: clean,
+        title,
+        imageUrl,
+        source: cleanText(best.source || ""),
+        domain: cleanText(best.domain || ""),
+        link: best.link || "",
+        position: best.position || null,
+        rawFirstResult: best,
+      };
+    } catch (error) {
+      console.warn("Serper ISBN görsel araması başarısız:", query, error.message);
+    }
+  }
+
+  return {
+    found: false,
+    message: "Serper Images üzerinde bu ISBN için uygun kitap sonucu bulunamadı.",
+  };
 }
 
 function scoreCoverCandidate(item, { isbn, title, author }) {
@@ -410,8 +521,8 @@ async function findCoverWithSerperImage({ isbn, title, author, publisher }) {
   const clean = cleanIsbn(isbn);
 
   const queries = [
+    clean ? `ISBN:${clean}` : "",
     clean ? `"${clean}" kitap kapağı` : "",
-    clean ? `"${clean}" book cover` : "",
     `${title || ""} ${author || ""} kitap kapağı ${clean}`,
     `${title || ""} ${author || ""} ${publisher || ""} kitap kapağı`,
     `${title || ""} ${author || ""} book cover`,
@@ -492,247 +603,104 @@ async function findYandexImage(title, author) {
 }
 
 // ----------------------------------------------------------------
-// GÜVENİLİR ISBN VERİ KAYNAKLARI
+// ISBN → SERPER IMAGE TITLE → GEMINI DETAILS
 // ----------------------------------------------------------------
 
-function getGoogleIsbnIdentifiers(volumeInfo) {
-  const identifiers = Array.isArray(volumeInfo?.industryIdentifiers)
-    ? volumeInfo.industryIdentifiers
-    : [];
-
-  return identifiers
-    .map((x) => normalizeIsbnForCompare(x.identifier))
-    .filter(Boolean);
-}
-
-function googleVolumeMatchesIsbn(volumeInfo, isbn) {
-  const clean = normalizeIsbnForCompare(isbn);
-  const isbn10 = convertIsbn13to10(clean);
-  const ids = getGoogleIsbnIdentifiers(volumeInfo);
-
-  return ids.some((id) => isbnMatches(clean, id) || isbnMatches(isbn10, id));
-}
-
-async function lookupGoogleBooksByIsbn(isbn) {
-  const clean = normalizeIsbnForCompare(isbn);
-
-  try {
-    const url = `https://www.googleapis.com/books/v1/volumes?q=isbn:${encodeURIComponent(
-      clean
-    )}&maxResults=5&printType=books`;
-
-    const data = await fetchJson(url);
-    const items = Array.isArray(data?.items) ? data.items : [];
-
-    const exact = items.find((item) =>
-      googleVolumeMatchesIsbn(item.volumeInfo, clean)
-    );
-
-    if (!exact) return null;
-
-    const info = exact.volumeInfo || {};
-
-    return {
-      source: "google_books",
-      sourceIsbn:
-        getGoogleIsbnIdentifiers(info).find((id) => isbnMatches(clean, id)) ||
-        clean,
-      title: info.title || null,
-      author: Array.isArray(info.authors) ? info.authors.join(", ") : null,
-      publisher: info.publisher || null,
-      pageCount:
-        typeof info.pageCount === "number" && Number.isFinite(info.pageCount)
-          ? info.pageCount
-          : null,
-      publishedDate: info.publishedDate || null,
-      description: cleanText(info.description || ""),
-      categories: Array.isArray(info.categories) ? info.categories : [],
-    };
-  } catch (error) {
-    console.warn("Google Books ISBN araması başarısız:", error.message);
-    return null;
-  }
-}
-
-async function lookupOpenLibraryByIsbn(isbn) {
-  const clean = normalizeIsbnForCompare(isbn);
-
-  try {
-    const editionUrl = `https://openlibrary.org/isbn/${encodeURIComponent(
-      clean
-    )}.json`;
-
-    const data = await fetchJson(editionUrl);
-
-    let authorNames = [];
-
-    if (Array.isArray(data?.authors)) {
-      const limitedAuthors = data.authors.slice(0, 3);
-
-      for (const authorRef of limitedAuthors) {
-        if (!authorRef?.key) continue;
-
-        try {
-          const authorData = await fetchJson(
-            `https://openlibrary.org${authorRef.key}.json`
-          );
-
-          if (authorData?.name) {
-            authorNames.push(authorData.name);
-          }
-        } catch {}
-      }
-    }
-
-    return {
-      source: "open_library",
-      sourceIsbn: clean,
-      title: data.title || null,
-      author: authorNames.length > 0 ? authorNames.join(", ") : null,
-      publisher:
-        Array.isArray(data.publishers) && data.publishers.length > 0
-          ? data.publishers[0]
-          : null,
-      pageCount:
-        typeof data.number_of_pages === "number" &&
-        Number.isFinite(data.number_of_pages)
-          ? data.number_of_pages
-          : null,
-      publishedDate: data.publish_date || null,
-      description:
-        typeof data.description === "string"
-          ? cleanText(data.description)
-          : typeof data.description?.value === "string"
-          ? cleanText(data.description.value)
-          : "",
-      categories:
-        Array.isArray(data.subjects) && data.subjects.length > 0
-          ? data.subjects.slice(0, 5)
-          : [],
-    };
-  } catch (error) {
-    console.warn("Open Library ISBN araması başarısız:", error.message);
-    return null;
-  }
-}
-
-function mergeBookData(primary, secondary) {
-  if (!primary && !secondary) return null;
-
-  const base = primary || secondary;
-  const other = primary ? secondary : null;
-
-  return {
-    source: base.source,
-    sourceIsbn: base.sourceIsbn,
-    title: base.title || other?.title || null,
-    author: base.author || other?.author || null,
-    publisher: base.publisher || other?.publisher || null,
-    pageCount: base.pageCount || other?.pageCount || null,
-    publishedDate: base.publishedDate || other?.publishedDate || null,
-    description: base.description || other?.description || "",
-    categories:
-      Array.isArray(base.categories) && base.categories.length > 0
-        ? base.categories
-        : Array.isArray(other?.categories)
-        ? other.categories
-        : [],
-  };
-}
-
-async function enrichBookWithGeminiIfNeeded(book, isbn) {
-  if (!book?.title || !book?.author) return book;
-
-  const needsDescription = !book.description || book.description.length < 40;
-  const needsCategories =
-    !Array.isArray(book.categories) || book.categories.length === 0;
-
-  if (!needsDescription && !needsCategories) return book;
+async function getBookDetailsFromGeminiBySerperTitle({ isbn, seed }) {
+  const clean = cleanIsbn(isbn);
 
   const prompt = `
-Aşağıdaki kitap için eksik açıklama ve kategori bilgilerini tamamla.
-Kitap zaten ISBN veri kaynaklarından doğrulanmıştır; kitap adını, yazarı, yayınevini ve sayfa sayısını değiştirme.
+Sen bir kitap veri çıkarma asistanısın.
 
-ISBN: ${isbn}
-Kitap adı: ${book.title}
-Yazar: ${book.author}
-Yayınevi: ${book.publisher || "Bilinmiyor"}
-Sayfa: ${book.pageCount || "Bilinmiyor"}
-Yayın tarihi: ${book.publishedDate || "Bilinmiyor"}
+Aşağıdaki ISBN, Serper Images üzerinde arandı ve kitap kapağı sonucundan bir başlık elde edildi.
+Görevin bu başlığı ve ISBN bilgisini kullanarak kitabın alanlarını doğru şekilde doldurmaktır.
 
-Sadece JSON döndür:
+ISBN: ${clean}
+
+Serper Images sonucu:
+${JSON.stringify(
+  {
+    titleFromImageResult: seed.title,
+    imageSource: seed.source,
+    imageDomain: seed.domain,
+    imageLink: seed.link,
+  },
+  null,
+  2
+)}
+
+Google Search kullanarak bu kitabı araştır ve SADECE şu JSON formatında cevap ver:
 
 {
+  "found": boolean,
+  "sourceIsbn": "${clean}",
+  "title": "Kitap Adı",
+  "author": "Yazar Adı",
+  "publisher": "Yayınevi",
+  "pageCount": number,
+  "publishedDate": "Yıl veya tarih",
   "description": "2-4 cümlelik Türkçe kısa özet",
   "categories": ["Kategori 1", "Kategori 2"]
 }
 
 Kurallar:
-- Kitap adını tahmin etme.
-- Yazar/yayınevi/sayfa bilgisi değiştirme.
+- Serper Images sonucundaki başlığı ana ipucu olarak kullan: "${seed.title}".
+- Başlığı tamamen farklı bir kitaba çevirme.
+- ISBN ile çelişen bir kitap bulursan found false döndür.
+- Yayınevi, sayfa sayısı ve yayın tarihi bulunamazsa null kullan.
+- Kapak görseli üretme; coverImageUrl alanı döndürme.
+- Link veya URL döndürme.
+- Markdown kullanma.
 - JSON dışında hiçbir şey yazma.
 `.trim();
 
-  try {
-    const text = await callGemini({
-      prompt,
-      temperature: 0.2,
-      googleSearch: true,
-    });
+  const text = await callGemini({
+    prompt,
+    temperature: 0,
+    googleSearch: true,
+  });
 
-    const extra = parseJsonFromText(text, {});
+  const parsed = parseJsonFromText(text, { found: false });
 
-    return {
-      ...book,
-      description:
-        book.description ||
-        (typeof extra.description === "string" ? extra.description : ""),
-      categories:
-        Array.isArray(book.categories) && book.categories.length > 0
-          ? book.categories
-          : Array.isArray(extra.categories)
-          ? extra.categories
-          : [],
-    };
-  } catch (error) {
-    console.warn("Gemini zenginleştirme başarısız:", error.message);
-    return book;
-  }
-}
+  const title =
+    typeof parsed.title === "string" && parsed.title.trim()
+      ? parsed.title.trim()
+      : seed.title;
 
-async function getBookByIsbnReliable(isbn) {
-  const clean = normalizeIsbnForCompare(isbn);
+  const hasBasicBookData =
+    parsed?.found === true &&
+    typeof title === "string" &&
+    title.trim().length > 1;
 
-  const googleBook = await lookupGoogleBooksByIsbn(clean);
-  const openLibraryBook = await lookupOpenLibraryByIsbn(clean);
-
-  console.log("📘 Google Books sonucu:", JSON.stringify(googleBook, null, 2));
-  console.log("📗 Open Library sonucu:", JSON.stringify(openLibraryBook, null, 2));
-
-  const merged = mergeBookData(googleBook, openLibraryBook);
-
-  if (!merged?.title || !merged?.author) {
+  if (!hasBasicBookData) {
     return {
       found: false,
-      message:
-        "Bu ISBN için güvenilir kitap verisi bulunamadı. Bilgileri manuel girebilirsin.",
+      message: "Gemini, Serper başlığından güvenilir kitap bilgisi çıkaramadı.",
     };
   }
-
-  const enriched = await enrichBookWithGeminiIfNeeded(merged, clean);
 
   return {
     found: true,
     sourceIsbn: clean,
-    title: enriched.title,
-    author: enriched.author,
-    publisher: enriched.publisher,
-    pageCount: enriched.pageCount,
-    publishedDate: enriched.publishedDate,
-    description: enriched.description,
-    categories: Array.isArray(enriched.categories)
-      ? enriched.categories.slice(0, 5)
-      : [],
+    title,
+    author:
+      typeof parsed.author === "string" && parsed.author.trim()
+        ? parsed.author.trim()
+        : null,
+    publisher:
+      typeof parsed.publisher === "string" && parsed.publisher.trim()
+        ? parsed.publisher.trim()
+        : null,
+    pageCount: parseNumberOrNull(parsed.pageCount),
+    publishedDate:
+      typeof parsed.publishedDate === "string" && parsed.publishedDate.trim()
+        ? parsed.publishedDate.trim()
+        : null,
+    description:
+      typeof parsed.description === "string" && parsed.description.trim()
+        ? parsed.description.trim()
+        : null,
+    categories: Array.isArray(parsed.categories) ? parsed.categories : [],
   };
 }
 
@@ -891,8 +859,8 @@ const server = http.createServer((req, res) => {
     return json(res, 200, {
       ok: true,
       message: "Backend çalışıyor.",
-      isbnData: "Google Books + Open Library",
-      enrichment: "Gemini",
+      isbnSeed: "Serper Images title",
+      details: "Gemini",
       cover: "Serper Images",
       model: GEMINI_MODEL,
     });
@@ -922,31 +890,33 @@ const server = http.createServer((req, res) => {
 
         console.log("📚 Gelen ISBN:", clean);
 
-        const book = await getBookByIsbnReliable(clean);
+        const seed = await findBookSeedFromSerperImage(clean);
 
-        console.log("📚 ISBN güvenilir veri cevabı:", JSON.stringify(book, null, 2));
+        console.log("🖼️ Serper seed:", JSON.stringify(seed, null, 2));
+
+        if (!seed?.found) {
+          return json(res, 200, {
+            found: false,
+            message:
+              seed?.message ||
+              "Bu ISBN için Serper Images üzerinde güvenilir bir kitap sonucu bulunamadı.",
+          });
+        }
+
+        const book = await getBookDetailsFromGeminiBySerperTitle({
+          isbn: clean,
+          seed,
+        });
+
+        console.log("🤖 Gemini kitap detay cevabı:", JSON.stringify(book, null, 2));
 
         if (!book?.found) {
           return json(res, 200, {
             found: false,
             message:
               book?.message ||
-              "Bu ISBN için güvenilir bir kayıt bulunamadı. Bilgileri manuel girebilirsin.",
+              "Bu ISBN için kitap bilgileri güvenilir şekilde doldurulamadı.",
           });
-        }
-
-        let finalCoverUrl = NO_PHOTO_URL;
-
-        try {
-          finalCoverUrl = await findCoverWithSerperImage({
-            isbn: clean,
-            title: book.title,
-            author: book.author,
-            publisher: book.publisher,
-          });
-        } catch (error) {
-          console.warn("Serper kapak arama hatası:", error.message);
-          finalCoverUrl = NO_PHOTO_URL;
         }
 
         const normalizedCategories = Array.isArray(book.categories)
@@ -957,7 +927,7 @@ const server = http.createServer((req, res) => {
 
         const normalized = {
           found: true,
-          title: book.title || null,
+          title: book.title || seed.title || null,
           author: book.author || null,
           publisher: book.publisher || null,
           pageCount:
@@ -968,7 +938,7 @@ const server = http.createServer((req, res) => {
               : null,
           publishedDate: book.publishedDate || null,
           description: book.description || null,
-          coverImageUrl: finalCoverUrl || NO_PHOTO_URL,
+          coverImageUrl: seed.imageUrl || NO_PHOTO_URL,
           categories: normalizedCategories,
         };
 
@@ -983,7 +953,7 @@ const server = http.createServer((req, res) => {
           found: false,
           message:
             err?.message ||
-            "Sunucu tarafında bir hata oluştu (ISBN güvenilir kaynak + Serper).",
+            "Sunucu tarafında bir hata oluştu (ISBN Serper Images + Gemini).",
         });
       }
     })();
@@ -1093,5 +1063,5 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`📡 Backend http://localhost:${PORT} üzerinde çalışıyor`);
-  console.log("🔎 Mod: Google Books + Open Library + Gemini + Serper Images");
+  console.log("🔎 Mod: Serper Images ISBN Seed + Gemini Details");
 });
