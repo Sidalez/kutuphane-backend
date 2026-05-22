@@ -1,8 +1,8 @@
 // backend/server.js
 // Node 18+ gerektirir.
-// Kitap bilgisi: Gemini
+// ISBN veri kaynağı: Google Books + Open Library
+// Eksik özet/kategori zenginleştirme: Gemini
 // Kapak görseli: Serper Images API
-// OpenAI / OpenRouter yoktur.
 
 const path = require("path");
 
@@ -96,6 +96,10 @@ function cleanIsbn(value) {
   return String(value || "").replace(/[^\dXx]/g, "").toUpperCase();
 }
 
+function normalizeIsbnForCompare(value) {
+  return cleanIsbn(value);
+}
+
 function convertIsbn13to10(isbn13) {
   const clean = cleanIsbn(isbn13);
 
@@ -179,6 +183,24 @@ function isBadCoverUrl(url) {
     lower.includes("no_photo") ||
     lower.includes("sprite")
   );
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const rawText = await response.text();
+
+  let data = {};
+  try {
+    data = rawText ? JSON.parse(rawText) : {};
+  } catch {
+    throw new Error(`JSON okunamadı. HTTP: ${response.status}`);
+  }
+
+  if (!response.ok) {
+    throw new Error(`İstek başarısız. HTTP: ${response.status}`);
+  }
+
+  return data;
 }
 
 // ----------------------------------------------------------------
@@ -327,7 +349,8 @@ async function serperImages(query, options = {}) {
 }
 
 function scoreCoverCandidate(item, { isbn, title, author }) {
-  const imageUrl = item.imageUrl || item.thumbnailUrl || item.image || item.url || "";
+  const imageUrl =
+    item.imageUrl || item.thumbnailUrl || item.image || item.url || "";
 
   const meta = cleanText(
     [
@@ -349,7 +372,9 @@ function scoreCoverCandidate(item, { isbn, title, author }) {
   const isbn10 = convertIsbn13to10(clean);
 
   if (clean && meta.includes(clean.toLowerCase())) score += 80;
-  if (isbn10 && isbn10 !== clean && meta.includes(isbn10.toLowerCase())) score += 50;
+  if (isbn10 && isbn10 !== clean && meta.includes(isbn10.toLowerCase())) {
+    score += 50;
+  }
 
   const titleWords = cleanText(title)
     .toLowerCase()
@@ -467,56 +492,253 @@ async function findYandexImage(title, author) {
 }
 
 // ----------------------------------------------------------------
-// GEMINI İŞ FONKSİYONLARI
+// GÜVENİLİR ISBN VERİ KAYNAKLARI
 // ----------------------------------------------------------------
 
-async function getBookByIsbnWithGemini(isbn) {
-  const clean = cleanIsbn(isbn);
+function getGoogleIsbnIdentifiers(volumeInfo) {
+  const identifiers = Array.isArray(volumeInfo?.industryIdentifiers)
+    ? volumeInfo.industryIdentifiers
+    : [];
+
+  return identifiers
+    .map((x) => normalizeIsbnForCompare(x.identifier))
+    .filter(Boolean);
+}
+
+function googleVolumeMatchesIsbn(volumeInfo, isbn) {
+  const clean = normalizeIsbnForCompare(isbn);
   const isbn10 = convertIsbn13to10(clean);
+  const ids = getGoogleIsbnIdentifiers(volumeInfo);
+
+  return ids.some((id) => isbnMatches(clean, id) || isbnMatches(isbn10, id));
+}
+
+async function lookupGoogleBooksByIsbn(isbn) {
+  const clean = normalizeIsbnForCompare(isbn);
+
+  try {
+    const url = `https://www.googleapis.com/books/v1/volumes?q=isbn:${encodeURIComponent(
+      clean
+    )}&maxResults=5&printType=books`;
+
+    const data = await fetchJson(url);
+    const items = Array.isArray(data?.items) ? data.items : [];
+
+    const exact = items.find((item) =>
+      googleVolumeMatchesIsbn(item.volumeInfo, clean)
+    );
+
+    if (!exact) return null;
+
+    const info = exact.volumeInfo || {};
+
+    return {
+      source: "google_books",
+      sourceIsbn:
+        getGoogleIsbnIdentifiers(info).find((id) => isbnMatches(clean, id)) ||
+        clean,
+      title: info.title || null,
+      author: Array.isArray(info.authors) ? info.authors.join(", ") : null,
+      publisher: info.publisher || null,
+      pageCount:
+        typeof info.pageCount === "number" && Number.isFinite(info.pageCount)
+          ? info.pageCount
+          : null,
+      publishedDate: info.publishedDate || null,
+      description: cleanText(info.description || ""),
+      categories: Array.isArray(info.categories) ? info.categories : [],
+    };
+  } catch (error) {
+    console.warn("Google Books ISBN araması başarısız:", error.message);
+    return null;
+  }
+}
+
+async function lookupOpenLibraryByIsbn(isbn) {
+  const clean = normalizeIsbnForCompare(isbn);
+
+  try {
+    const editionUrl = `https://openlibrary.org/isbn/${encodeURIComponent(
+      clean
+    )}.json`;
+
+    const data = await fetchJson(editionUrl);
+
+    let authorNames = [];
+
+    if (Array.isArray(data?.authors)) {
+      const limitedAuthors = data.authors.slice(0, 3);
+
+      for (const authorRef of limitedAuthors) {
+        if (!authorRef?.key) continue;
+
+        try {
+          const authorData = await fetchJson(
+            `https://openlibrary.org${authorRef.key}.json`
+          );
+
+          if (authorData?.name) {
+            authorNames.push(authorData.name);
+          }
+        } catch {}
+      }
+    }
+
+    return {
+      source: "open_library",
+      sourceIsbn: clean,
+      title: data.title || null,
+      author: authorNames.length > 0 ? authorNames.join(", ") : null,
+      publisher:
+        Array.isArray(data.publishers) && data.publishers.length > 0
+          ? data.publishers[0]
+          : null,
+      pageCount:
+        typeof data.number_of_pages === "number" &&
+        Number.isFinite(data.number_of_pages)
+          ? data.number_of_pages
+          : null,
+      publishedDate: data.publish_date || null,
+      description:
+        typeof data.description === "string"
+          ? cleanText(data.description)
+          : typeof data.description?.value === "string"
+          ? cleanText(data.description.value)
+          : "",
+      categories:
+        Array.isArray(data.subjects) && data.subjects.length > 0
+          ? data.subjects.slice(0, 5)
+          : [],
+    };
+  } catch (error) {
+    console.warn("Open Library ISBN araması başarısız:", error.message);
+    return null;
+  }
+}
+
+function mergeBookData(primary, secondary) {
+  if (!primary && !secondary) return null;
+
+  const base = primary || secondary;
+  const other = primary ? secondary : null;
+
+  return {
+    source: base.source,
+    sourceIsbn: base.sourceIsbn,
+    title: base.title || other?.title || null,
+    author: base.author || other?.author || null,
+    publisher: base.publisher || other?.publisher || null,
+    pageCount: base.pageCount || other?.pageCount || null,
+    publishedDate: base.publishedDate || other?.publishedDate || null,
+    description: base.description || other?.description || "",
+    categories:
+      Array.isArray(base.categories) && base.categories.length > 0
+        ? base.categories
+        : Array.isArray(other?.categories)
+        ? other.categories
+        : [],
+  };
+}
+
+async function enrichBookWithGeminiIfNeeded(book, isbn) {
+  if (!book?.title || !book?.author) return book;
+
+  const needsDescription = !book.description || book.description.length < 40;
+  const needsCategories =
+    !Array.isArray(book.categories) || book.categories.length === 0;
+
+  if (!needsDescription && !needsCategories) return book;
 
   const prompt = `
-Sen bir kitap veri asistanısın.
+Aşağıdaki kitap için eksik açıklama ve kategori bilgilerini tamamla.
+Kitap zaten ISBN veri kaynaklarından doğrulanmıştır; kitap adını, yazarı, yayınevini ve sayfa sayısını değiştirme.
 
-Görevin verilen ISBN için Google Search kullanarak güvenilir kitap meta verisini bulmak ve sadece JSON döndürmektir.
+ISBN: ${isbn}
+Kitap adı: ${book.title}
+Yazar: ${book.author}
+Yayınevi: ${book.publisher || "Bilinmiyor"}
+Sayfa: ${book.pageCount || "Bilinmiyor"}
+Yayın tarihi: ${book.publishedDate || "Bilinmiyor"}
 
-Aranacak ISBN:
-- ISBN-13: ${clean}
-- ISBN-10: ${isbn10 || "Yok"}
-
-Çıktı formatı kesinlikle şu JSON olsun:
+Sadece JSON döndür:
 
 {
-  "found": boolean,
-  "sourceIsbn": "Doğruladığın ISBN değeri",
-  "title": "Kitap Adı",
-  "author": "Yazar Adı",
-  "publisher": "Yayınevi",
-  "pageCount": number,
-  "publishedDate": "Yıl",
   "description": "2-4 cümlelik Türkçe kısa özet",
   "categories": ["Kategori 1", "Kategori 2"]
 }
 
 Kurallar:
-- Sadece ISBN-13 ${clean} veya ISBN-10 ${isbn10} ile eşleşen kitabı kabul et.
-- Kitap bulunduysa "found": true yap.
-- Kitap bulunduysa "sourceIsbn" alanına mutlaka ${clean} yaz. ISBN-10 ile doğruladıysan yine sourceIsbn alanına ${clean} yaz.
-- Eğer kitap bilgilerine ulaşırsan ama sayfa/yayınevi/yıl eksikse kitabı yine found true döndür; eksik alanları null yap.
-- Emin değilsen found false döndür.
-- Liste sayfası, blog başlığı, Reddit, YouTube veya genel öneri sayfasını kitap sanma.
-- Kapak görseli, link veya URL üretme. Kapak görseli Serper Images tarafından bulunacak.
-- Markdown kullanma.
+- Kitap adını tahmin etme.
+- Yazar/yayınevi/sayfa bilgisi değiştirme.
 - JSON dışında hiçbir şey yazma.
 `.trim();
 
-  const text = await callGemini({
-    prompt,
-    temperature: 0,
-    googleSearch: true,
-  });
+  try {
+    const text = await callGemini({
+      prompt,
+      temperature: 0.2,
+      googleSearch: true,
+    });
 
-  return parseJsonFromText(text, { found: false });
+    const extra = parseJsonFromText(text, {});
+
+    return {
+      ...book,
+      description:
+        book.description ||
+        (typeof extra.description === "string" ? extra.description : ""),
+      categories:
+        Array.isArray(book.categories) && book.categories.length > 0
+          ? book.categories
+          : Array.isArray(extra.categories)
+          ? extra.categories
+          : [],
+    };
+  } catch (error) {
+    console.warn("Gemini zenginleştirme başarısız:", error.message);
+    return book;
+  }
 }
+
+async function getBookByIsbnReliable(isbn) {
+  const clean = normalizeIsbnForCompare(isbn);
+
+  const googleBook = await lookupGoogleBooksByIsbn(clean);
+  const openLibraryBook = await lookupOpenLibraryByIsbn(clean);
+
+  console.log("📘 Google Books sonucu:", JSON.stringify(googleBook, null, 2));
+  console.log("📗 Open Library sonucu:", JSON.stringify(openLibraryBook, null, 2));
+
+  const merged = mergeBookData(googleBook, openLibraryBook);
+
+  if (!merged?.title || !merged?.author) {
+    return {
+      found: false,
+      message:
+        "Bu ISBN için güvenilir kitap verisi bulunamadı. Bilgileri manuel girebilirsin.",
+    };
+  }
+
+  const enriched = await enrichBookWithGeminiIfNeeded(merged, clean);
+
+  return {
+    found: true,
+    sourceIsbn: clean,
+    title: enriched.title,
+    author: enriched.author,
+    publisher: enriched.publisher,
+    pageCount: enriched.pageCount,
+    publishedDate: enriched.publishedDate,
+    description: enriched.description,
+    categories: Array.isArray(enriched.categories)
+      ? enriched.categories.slice(0, 5)
+      : [],
+  };
+}
+
+// ----------------------------------------------------------------
+// GEMINI ÖNERİ FONKSİYONLARI
+// ----------------------------------------------------------------
 
 async function getReadingAdviceWithGemini(payload) {
   const {
@@ -576,12 +798,11 @@ Her öneriyi kesinlikle şu tek satır formatında yaz:
 - Kitap: Tek kitap adı | Yazar: Yazar adı | Yayinevi: Yayınevi adı veya Bilinmiyor | Sayfa: sayı veya Bilinmiyor | Tur: tür/kategori | Ozet: 1 kısa cümle | Neden: Bugün neden bu kitap seçilmeli.
 
 Kurallar:
-- Genel liste başlıklarını kitap sanma. Örnek: “En iyi 100 kitap”, “Kitap önerileri listesi”, Reddit başlığı, YouTube başlığı kitap değildir.
+- Genel liste başlıklarını kitap sanma.
 - Gerçek kitap adı ve gerçek yazar adı ver.
 - Yayınevi biliniyorsa mutlaka Yayinevi alanına yaz.
 - Sayfa sayısı biliniyorsa mutlaka Sayfa alanına yaz.
 - Her kitap tek madde olsun.
-- Sayfa, yayınevi, özet, tür, neden gibi detayları ayrı satıra bölme.
 - Alan adlarını aynen şu şekilde yaz: Kitap, Yazar, Yayinevi, Sayfa, Tur, Ozet, Neden.
 - JSON verme.
 - Markdown tablo verme.
@@ -634,7 +855,6 @@ Sadece JSON array döndür:
 
 Kurallar:
 - Genel liste başlıklarını kitap sanma.
-- “En iyi 100 kitap”, “Elinizden düşürmeyeceğiniz 100 kitap önerisi”, Reddit başlığı, YouTube başlığı, blog başlığı öneri değildir.
 - Gerçek kitap adı ve gerçek yazar adı ver.
 - Son okudukları listesindeki kitapları önerme.
 - Türkçeye çevrilmiş veya Türkçe yazılmış kitapları tercih et.
@@ -671,7 +891,8 @@ const server = http.createServer((req, res) => {
     return json(res, 200, {
       ok: true,
       message: "Backend çalışıyor.",
-      ai: "Gemini",
+      isbnData: "Google Books + Open Library",
+      enrichment: "Gemini",
       cover: "Serper Images",
       model: GEMINI_MODEL,
     });
@@ -701,39 +922,15 @@ const server = http.createServer((req, res) => {
 
         console.log("📚 Gelen ISBN:", clean);
 
-        const book = await getBookByIsbnWithGemini(clean);
+        const book = await getBookByIsbnReliable(clean);
 
-        console.log("🤖 Gemini kitap cevabı:", JSON.stringify(book, null, 2));
+        console.log("📚 ISBN güvenilir veri cevabı:", JSON.stringify(book, null, 2));
 
-        const sourceIsbnRaw =
-          typeof book.sourceIsbn === "string" ||
-          typeof book.sourceIsbn === "number"
-            ? String(book.sourceIsbn)
-            : "";
-
-        const hasIsbnMatch = sourceIsbnRaw
-          ? isbnMatches(clean, sourceIsbnRaw)
-          : false;
-
-        const hasBasicBookData =
-          book?.found === true &&
-          typeof book.title === "string" &&
-          book.title.trim().length > 1 &&
-          typeof book.author === "string" &&
-          book.author.trim().length > 1;
-
-        if (!book?.found || (!hasIsbnMatch && !hasBasicBookData)) {
-          console.warn("⚠️ Gemini kitap bulamadı veya güvenilir temel veri dönmedi.", {
-            clean,
-            sourceIsbnRaw,
-            hasIsbnMatch,
-            hasBasicBookData,
-            book,
-          });
-
+        if (!book?.found) {
           return json(res, 200, {
             found: false,
             message:
+              book?.message ||
               "Bu ISBN için güvenilir bir kayıt bulunamadı. Bilgileri manuel girebilirsin.",
           });
         }
@@ -786,7 +983,7 @@ const server = http.createServer((req, res) => {
           found: false,
           message:
             err?.message ||
-            "Sunucu tarafında bir hata oluştu (ISBN Gemini + Serper).",
+            "Sunucu tarafında bir hata oluştu (ISBN güvenilir kaynak + Serper).",
         });
       }
     })();
@@ -896,5 +1093,5 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`📡 Backend http://localhost:${PORT} üzerinde çalışıyor`);
-  console.log("🔎 Mod: Gemini + Serper Images");
+  console.log("🔎 Mod: Google Books + Open Library + Gemini + Serper Images");
 });
