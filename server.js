@@ -328,6 +328,7 @@ async function serperImages(query, options = {}) {
 
 function scoreCoverCandidate(item, { isbn, title, author }) {
   const imageUrl = item.imageUrl || item.thumbnailUrl || item.image || item.url || "";
+
   const meta = cleanText(
     [
       item.title,
@@ -384,8 +385,8 @@ async function findCoverWithSerperImage({ isbn, title, author, publisher }) {
   const clean = cleanIsbn(isbn);
 
   const queries = [
-    `"${clean}" kitap kapağı`,
-    `"${clean}" book cover`,
+    clean ? `"${clean}" kitap kapağı` : "",
+    clean ? `"${clean}" book cover` : "",
     `${title || ""} ${author || ""} kitap kapağı ${clean}`,
     `${title || ""} ${author || ""} ${publisher || ""} kitap kapağı`,
     `${title || ""} ${author || ""} book cover`,
@@ -439,12 +440,14 @@ async function findCoverWithSerperImage({ isbn, title, author, publisher }) {
   const sorted = candidates.sort((a, b) => b.score - a.score);
 
   const bestDirectImage = sorted.find((x) => isImageUrl(x.url));
+
   if (bestDirectImage) {
     console.log("✅ Kapak kaynağı: Serper Images", bestDirectImage.url);
     return bestDirectImage.url;
   }
 
   const bestAnyImage = sorted[0];
+
   if (bestAnyImage?.url) {
     console.log("✅ Kapak kaynağı: Serper Images fallback", bestAnyImage.url);
     return bestAnyImage.url;
@@ -454,7 +457,6 @@ async function findCoverWithSerperImage({ isbn, title, author, publisher }) {
   return NO_PHOTO_URL;
 }
 
-// Eski endpointlerde fonksiyon adı kullanılıyorsa bozulmasın diye korunuyor.
 async function findYandexImage(title, author) {
   return findCoverWithSerperImage({
     isbn: "",
@@ -470,17 +472,22 @@ async function findYandexImage(title, author) {
 
 async function getBookByIsbnWithGemini(isbn) {
   const clean = cleanIsbn(isbn);
+  const isbn10 = convertIsbn13to10(clean);
 
   const prompt = `
 Sen bir kitap veri asistanısın.
 
 Görevin verilen ISBN için Google Search kullanarak güvenilir kitap meta verisini bulmak ve sadece JSON döndürmektir.
 
+Aranacak ISBN:
+- ISBN-13: ${clean}
+- ISBN-10: ${isbn10 || "Yok"}
+
 Çıktı formatı kesinlikle şu JSON olsun:
 
 {
   "found": boolean,
-  "sourceIsbn": "Bulduğun gerçek ISBN veya null",
+  "sourceIsbn": "Doğruladığın ISBN değeri",
   "title": "Kitap Adı",
   "author": "Yazar Adı",
   "publisher": "Yayınevi",
@@ -491,12 +498,13 @@ Görevin verilen ISBN için Google Search kullanarak güvenilir kitap meta veris
 }
 
 Kurallar:
-- ISBN: ${clean}
-- Sadece bu ISBN ile birebir eşleşen kitap sonucunu kabul et.
-- ISBN alanında ${clean} açıkça görünmüyorsa found false döndür.
-- Emin değilsen tahmin etme.
+- Sadece ISBN-13 ${clean} veya ISBN-10 ${isbn10} ile eşleşen kitabı kabul et.
+- Kitap bulunduysa "found": true yap.
+- Kitap bulunduysa "sourceIsbn" alanına mutlaka ${clean} yaz. ISBN-10 ile doğruladıysan yine sourceIsbn alanına ${clean} yaz.
+- Eğer kitap bilgilerine ulaşırsan ama sayfa/yayınevi/yıl eksikse kitabı yine found true döndür; eksik alanları null yap.
+- Emin değilsen found false döndür.
 - Liste sayfası, blog başlığı, Reddit, YouTube veya genel öneri sayfasını kitap sanma.
-- Kapak görseli, link veya URL üretme. Kapak görseli başka sistem tarafından bulunacak.
+- Kapak görseli, link veya URL üretme. Kapak görseli Serper Images tarafından bulunacak.
 - Markdown kullanma.
 - JSON dışında hiçbir şey yazma.
 `.trim();
@@ -695,18 +703,32 @@ const server = http.createServer((req, res) => {
 
         const book = await getBookByIsbnWithGemini(clean);
 
+        console.log("🤖 Gemini kitap cevabı:", JSON.stringify(book, null, 2));
+
         const sourceIsbnRaw =
           typeof book.sourceIsbn === "string" ||
           typeof book.sourceIsbn === "number"
             ? String(book.sourceIsbn)
             : "";
 
-        const match = isbnMatches(clean, sourceIsbnRaw);
+        const hasIsbnMatch = sourceIsbnRaw
+          ? isbnMatches(clean, sourceIsbnRaw)
+          : false;
 
-        if (!book?.found || !match) {
-          console.warn("⚠️ Gemini kitap bulamadı veya ISBN eşleşmedi.", {
+        const hasBasicBookData =
+          book?.found === true &&
+          typeof book.title === "string" &&
+          book.title.trim().length > 1 &&
+          typeof book.author === "string" &&
+          book.author.trim().length > 1;
+
+        if (!book?.found || (!hasIsbnMatch && !hasBasicBookData)) {
+          console.warn("⚠️ Gemini kitap bulamadı veya güvenilir temel veri dönmedi.", {
             clean,
             sourceIsbnRaw,
+            hasIsbnMatch,
+            hasBasicBookData,
+            book,
           });
 
           return json(res, 200, {
