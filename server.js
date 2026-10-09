@@ -247,6 +247,12 @@ async function callGemini({
 
     if (!response.ok) {
       console.error("❌ Gemini hata:", JSON.stringify(data, null, 2));
+      if (response.status === 429) {
+        const error = new Error("Yapay zekâ servisinin kullanım kotası doldu. Yeni kitap keşfi için kota yenilendiğinde tekrar deneyebilirsin. Bu sırada ‘Rafımdan seç’ ile kütüphanendeki kitaplardan öneri alabilirsin.");
+        error.status = 429;
+        error.code = "AI_QUOTA_EXCEEDED";
+        throw error;
+      }
       throw new Error(
         data?.error?.message ||
           data?.message ||
@@ -267,6 +273,7 @@ async function callGemini({
   try {
     return await sendRequest(googleSearch);
   } catch (error) {
+    if (error.status === 429) throw error;
     if (googleSearch) {
       console.warn(
         "⚠️ Gemini google_search ile cevap alınamadı. Aramasız tekrar deneniyor..."
@@ -2451,7 +2458,27 @@ Kitapların baskısı belli olmadığı için yayınevi, sayfa sayısı veya ISB
 Özet ve gerekçeleri kısa tut, neden bu kullanıcıya uygun olduğunu açıkla. Ton: ${context.tone}.
 Yalnızca şu JSON'u döndür:
 {"profile":"Kısa profil yorumu","strategy":"Öneri stratejisi","recommendations":[{"candidateId":0,"title":"Kitap adı","author":"Yazar","genre":"Tür","summary":"Kısa konu, spoiler yok","reason":"Kişiye özel gerekçe"}]}`;
-  const raw = await callGemini({ prompt, temperature: 0.3, googleSearch: goal === "choose_new_book" });
+  let raw;
+  try {
+    raw = await callGemini({ prompt, temperature: 0.3, googleSearch: goal === "choose_new_book" });
+  } catch (error) {
+    if (error.status !== 429 || goal !== "choose_library_book") throw error;
+    const preferences = normalizeSuggestionText(context.preferenceText);
+    const ranked = candidates.map(book => {
+      const categories = Array.isArray(book.categories) ? book.categories : [];
+      const matches = categories.filter(category => preferences.includes(normalizeSuggestionText(category)));
+      const score = (book.status === "OKUNUYOR" ? 8 : 0) + (Number(book.progressRating || book.expectedRating) || 0) * 2 + matches.length * 5;
+      return { book, score, matches };
+    }).sort((a, b) => b.score - a.score).slice(0, 3);
+    const books = ranked.map(({ book, matches }) => ({
+      title: book.title, author: book.author, publisher: book.publisher, pageCount: book.totalPages,
+      publishYear: book.publishYear, isbn: book.isbn,
+      genre: Array.isArray(book.categories) ? book.categories.join(", ") : "",
+      summary: "",
+      reason: [book.status === "OKUNUYOR" ? "Okumaya başladığın bu kitaba kaldığın yerden devam edebilirsin." : "Kütüphanende okunmayı bekliyor.", matches.length ? `Tercihinle eşleşen tür: ${matches.join(", ")}.` : "", book.expectedRating ? "Beklenti puanın da seçimde dikkate alındı." : ""].filter(Boolean).join(" "),
+    }));
+    return { source: "library_rules", books, text: ["Kısa Profil Özeti", "- AI kotası dolduğu için bu seçimler kütüphanendeki durum, puan ve tür bilgilerine göre hazırlandı.", "Kesinlikle Başlaman Gerekenler", ...books.map(book => `- Kitap: ${book.title} | Yazar: ${book.author} | Neden: ${book.reason}`)].join("\n") };
+  }
   const result = parseJsonFromText(raw, null);
   if (!result || !Array.isArray(result.recommendations)) throw new Error("Öneriler okunamadı. Lütfen tekrar dene.");
   const seen = new Set();
@@ -2510,7 +2537,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, await recommendBooks(payload));
       } catch (error) {
         console.error("Kitap öneri hatası:", error.message);
-        return json(res, error.status || 502, { success: false, message: error.message || "Öneriler şu anda alınamıyor." });
+        return json(res, error.status || 502, { success: false, code: error.code, message: error.message || "Öneriler şu anda alınamıyor." });
       }
     }
     // ------------------------------------------------------------
