@@ -21,6 +21,11 @@ assert.equal(consensus([
  {publisher:'Profil Kitap',editionSource:'https://one.test/book'},
  {publisher:'Profil Yayıncılık',editionSource:'https://two.test/book'},
 ], 'publisher'), 'Profil Kitap');
+assert.equal(consensus([
+ {author:'Ayşenur Okatan, Nurulhude Baykal, Tuba Sarıgül',editionSource:'https://one.test/book'},
+ {author:'Tuba Sarıgül, Ayşenur Okatan, Nurulhude Baykal',editionSource:'https://two.test/book'},
+], 'author'), 'Ayşenur Okatan, Nurulhude Baykal, Tuba Sarıgül');
+assert.equal(parseEdition(publisherPage,'https://one.test/book',{searchTitle:'Çizgi Bilim - Aziz Sancar'},'9786052999264').title,'Çizgi Bilim - Aziz Sancar');
 async function check(secondPages) {
  const research=createIsbnResearch({search:async()=>({organic:[{link:'https://one.test/book'},{link:'https://two.test/book'}]}),fetchPage:async url=>({ok:true,text:async()=>html(url.includes('one.test')?192:secondPages)})});
  return research('9786259355948');

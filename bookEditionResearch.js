@@ -22,7 +22,7 @@ function validIsbn(value) {
 }
 // Academic and medical honorifics are not part of the person's identity.
 const authorName = value => plain(value).replace(/^(?:(?:Prof(?:esör)?|Doç(?:ent)?|Dr|Doktor|Uzm|Op|Yrd)\.?\s+)+/iu, '').trim();
-const name = value => typeof value === 'string' ? value : Array.isArray(value) ? value.map(name).join(' ') : value?.name || '';
+const name = value => typeof value === 'string' ? value : Array.isArray(value) ? value.map(name).join(', ') : value?.name || '';
 function parseEdition(html, url, book = {}, expectedIsbn) {
   const text = plain(html);
   const heading = plain(html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1] || html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]);
@@ -45,13 +45,20 @@ function parseEdition(html, url, book = {}, expectedIsbn) {
   const publisher = plain(name(schema?.publisher) || name(schema?.brand) || brandMeta || publisherLabel) || null;
   const pages = Number(schema?.numberOfPages || text.match(/(?:Sayfa\s*(?:Sayısı|Adedi)|Sayfa)\s*:?\s*(\d{1,4})\b/i)?.[1]);
   const date = String(schema?.datePublished || text.match(/(?:Yayın Tarihi|Yayımlanma Tarihi|Basım Tarihi|Basım Yılı|Yayın Yılı|Çıkış Tarihi)\s*:?\s*((?:(?:Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık)\s+)?(?:\d{1,2}[./-]){0,2}(?:19|20)\d{2}(?:-\d{2})?)/i)?.[1] || '');
-  const authorLabel = text.match(/(?:Yazar(?:ı)?|Eser Sahibi)\s*:\s*(.{2,100}?)(?=\s+(?:Yayınevi|Yayıncı|Barkod|ISBN|Sayfa|Boyut|Çevirmen|Kategori|Dil|Yayın|Basım|Cilt|Kağıt|Kâğıt|Kapak|Ürün|Stok|Orijinal)\b|$)/i)?.[1];
+  const authorLabel = text.match(/(?:Yazar(?:ı)?|Eser Sahibi)\s*:\s*(.{2,100}?)(?=\s+(?:Çizer|Tür|Kazanacağınız|Yayınevi|Yayıncı|Barkod|ISBN|Sayfa|Boyut|Çevirmen|Kategori|Dil|Yayın|Basım|Cilt|Kağıt|Kâğıt|Kapak|Ürün|Stok|Orijinal)\b|$)/i)?.[1];
   const authorLink = [...html.matchAll(/<a\b[^>]*href=["'][^"']*\/yazar\/[^"']+["'][^>]*>([\s\S]*?)<\/a>/gi)].map(match => plain(match[1])).find(Boolean);
   const ogTitle = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i)?.[1];
-  const title = plain(schema?.name || book.searchTitle || ogTitle || html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1]).split(/\s+[|–-]\s+/)[0].trim() || null;
-  const author = authorName(name(schema?.author) || authorLabel || authorLink) || null;
+  let title = plain(schema?.name || book.searchTitle || ogTitle || html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1]).split(/\s+[|–]\s+/)[0].trim() || null;
+  const rawAuthor = authorName(name(schema?.author) || authorLabel || authorLink);
+  const author = /^(?:Yazar Yok|Yok|Bilinmiyor|Belirtilmemiş)$/i.test(rawAuthor) ? null : rawAuthor || null;
+  if (title) {
+    const parts = title.split(/\s+-\s+/);
+    while (parts.length > 1 && [publisher, author].filter(Boolean).some(value => normalize(value) === normalize(parts[parts.length - 1]))) parts.pop();
+    title = parts.join(' - ');
+  }
   return { title, author, description: cleanDescription(schema?.description), isbn, publisher, pageCount: pages > 0 && pages < 10000 ? pages : null, publishYear: date.match(/(?:19|20)\d{2}/)?.[0] || null, editionSource: url };
 }
+const authorIdentity = value => authorName(value).split(/\s*[,;|]\s*|\s+ve\s+/iu).map(normalize).filter(Boolean).sort().join('|');
 const publisherIdentity = value => normalize(value).replace(/(?:yayinlari|yayinevi|yayincilik|yayin|kitap)$/, '');
 function resolvedPublisher(sources) {
   const agreed = consensus(sources, 'publisher');
@@ -66,7 +73,7 @@ function consensus(sources, field) {
   const groups = new Map();
   for (const source of sources) {
     if (source[field] == null) continue;
-    const key = field === 'publisher' ? publisherIdentity(source[field]) : normalize(field === 'author' ? authorName(source[field]) : source[field]);
+    const key = field === 'publisher' ? publisherIdentity(source[field]) : field === 'author' ? authorIdentity(source[field]) : normalize(source[field]);
     if (!groups.has(key)) groups.set(key, { value: field === 'author' ? authorName(source[field]) : source[field], hosts: new Set() });
     groups.get(key).hosts.add(new URL(source.editionSource).hostname.replace(/^www\./, ''));
   }
@@ -106,7 +113,7 @@ function createIsbnResearch({ search, fetchPage }) {
     const isbn = validIsbn(value);
     if (!isbn) return { found: false, message: "Geçerli bir ISBN-13 girilmelidir." };
     const sources = new Map();
-    for (const suffix of ["kitap yazar yayınevi sayfa", "ISBN yazar sayfa sayısı", "yayınevi yayıncı marka"]) {
+    for (const suffix of ["kitap yazar yayınevi sayfa", "ISBN yazar sayfa sayısı", "yazar", "yayınevi yayıncı marka"]) {
       const result = await search(`"${isbn}" ${suffix}`);
       const links = [...new Set((result.organic || []).map(item => item.link))].filter(link => /^https:\/\//.test(link) && !sources.has(link)).slice(0, 8);
       await Promise.all(links.map(async link => {
