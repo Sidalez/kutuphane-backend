@@ -225,6 +225,7 @@ async function callGemini({
 
     const response = await fetch(url, {
       method: "POST",
+      signal: AbortSignal.timeout(45000),
       headers: {
         "Content-Type": "application/json",
         "x-goog-api-key": GEMINI_API_KEY,
@@ -284,6 +285,7 @@ async function callGemini({
 async function serperRequest(endpoint, payload) {
   const response = await fetch(`https://google.serper.dev/${endpoint}`, {
     method: "POST",
+    signal: AbortSignal.timeout(12000),
     headers: {
       "X-API-KEY": SERPER_API_KEY,
       "Content-Type": "application/json",
@@ -2377,7 +2379,7 @@ async function recommendBooks(payload) {
       expectedRating: book.expectedRating, progressRating: book.progressRating,
     }));
   if (goal === "choose_library_book" && !candidates.length) {
-    return "Öneri Stratejisi\n- Kütüphanende okunacak veya okunuyor durumunda kitap bulunmuyor. Önce kitap ekleyebilir veya yeni kitap önerisi seçebilirsin.";
+    return { text: "Öneri Stratejisi\n- Kütüphanende okunacak veya okunuyor durumunda kitap bulunmuyor. Önce kitap ekleyebilir veya yeni kitap önerisi seçebilirsin.", books: [] };
   }
   const context = {
     goal, mood: cleanText(payload.mood).slice(0, 200),
@@ -2401,6 +2403,7 @@ Yalnızca şu JSON'u döndür:
   const result = parseJsonFromText(raw, null);
   if (!result || !Array.isArray(result.recommendations)) throw new Error("Öneriler okunamadı. Lütfen tekrar dene.");
   const seen = new Set();
+  const suggestedBooks = [];
   const items = result.recommendations.slice(0, 6).flatMap((item) => {
     if (!item || typeof item !== "object") return [];
     const book = goal === "choose_library_book" ? candidates.find((b) => b.candidateId === item.candidateId) : null;
@@ -2410,13 +2413,24 @@ Yalnızca şu JSON'u döndür:
     const key = `${title}|${author}`.toLocaleLowerCase("tr-TR");
     if (!title || seen.has(key)) return [];
     seen.add(key);
+    if (suggestedBooks.length >= 3) return [];
+    suggestedBooks.push({ title, author, genre: cleanText(item.genre), summary: cleanText(item.summary), reason: cleanText(item.reason) });
     const field = (value) => cleanText(value).replace(/\|/g, ",");
     return [`- Kitap: ${field(title)} | Yazar: ${field(author)} | Tür: ${field(item.genre)} | Özet: ${field(item.summary)} | Neden: ${field(item.reason)}`];
   }).slice(0, 3);
   if (!items.length) throw new Error("Uygun kitap önerisi oluşturulamadı. Tercihlerini değiştirip tekrar dene.");
-  return ["Kısa Profil Özeti", `- ${cleanText(result.profile) || "Tercihlerine göre kitaplar seçildi."}`,
+  if (goal === "choose_new_book") {
+    await Promise.all(suggestedBooks.map(async (book) => {
+      try {
+        const image = await getFirstSerperImageUrl(`${book.title} ${book.author} kitap kapağı`);
+        if (image.firstResult) book.coverImageUrl = image.imageUrl;
+      } catch (error) { console.warn("Öneri kapağı alınamadı:", error.message); }
+    }));
+  }
+  const text = ["Kısa Profil Özeti", `- ${cleanText(result.profile) || "Tercihlerine göre kitaplar seçildi."}`,
     "Öneri Stratejisi", `- ${cleanText(result.strategy) || "Ruh halin ve ayırdığın süre dikkate alındı."}`,
     goal === "choose_library_book" ? "Kesinlikle Başlaman Gerekenler" : "Satın Alabileceğin Öneriler", ...items].join("\n");
+  return { text, books: suggestedBooks };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -2439,7 +2453,7 @@ const server = http.createServer(async (req, res) => {
         if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
           return json(res, 400, { success: false, message: "Geçerli bir öneri isteği gönderilmelidir." });
         }
-        return json(res, 200, { text: await recommendBooks(payload) });
+        return json(res, 200, await recommendBooks(payload));
       } catch (error) {
         console.error("Kitap öneri hatası:", error.message);
         return json(res, error.status || 502, { success: false, message: error.message || "Öneriler şu anda alınamıyor." });
