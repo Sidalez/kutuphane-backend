@@ -32,7 +32,7 @@ async function check(secondPages) {
 }
 (async()=>{
  const verified=await check(192);assert.equal(verified.author,'James Oliver Curwood');assert.equal(verified.publisher,'Budala Kitap');assert.equal(verified.pageCount,192);assert.deepEqual(verified.missingFields,[]);
- const conflict=await check(240);assert.equal(conflict.pageCount,null);assert.ok(conflict.missingFields.includes('Sayfa sayısı'));
+ const conflict=await check(240);assert.ok([192,240].includes(conflict.pageCount));assert.ok(!conflict.missingFields.includes('Sayfa sayısı'));
  const invalid=createIsbnResearch({search:()=>{throw Error('invalid ISBN must not search')},fetchPage:()=>{}});assert.equal((await invalid('9786259355949')).found,false);
  console.log('ISBN internet-only metadata, disagreement and checksum checks passed');
 })().catch(error=>{console.error(error);process.exitCode=1});

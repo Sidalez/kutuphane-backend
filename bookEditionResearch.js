@@ -108,6 +108,20 @@ function createEditionResearch({ search, fetchPage }) {
 }
 module.exports = { cleanDescription, validIsbn, parseEdition, consensus, createEditionResearch };
 
+function bestSourcedValue(sources, field) {
+  const agreed = field === 'publisher' ? resolvedPublisher(sources) : consensus(sources, field);
+  if (agreed != null) return agreed;
+  const candidates = sources.filter(source => source[field] != null && !String(source[field]).includes('�'));
+  const ranked = candidates.map(source => {
+    const host = new URL(source.editionSource).hostname;
+    const official = /(?:^|\.)gov\.tr$/.test(host);
+    const completeness = [source.title, source.author, source.publisher, source.pageCount, source.publishYear].filter(Boolean).length;
+    const authors = field === 'author' ? authorIdentity(source.author).split('|').length : 0;
+    const genericAuthor = field === 'author' && /^(?:kolektif|komisyon|anonim)$/i.test(source.author);
+    return { source, score: (official ? 100 : 0) + completeness + (genericAuthor ? -20 : authors * 5) };
+  }).sort((a,b) => b.score-a.score);
+  return ranked[0]?.source[field] ?? null;
+}
 function createIsbnResearch({ search, fetchPage }) {
   return async function researchIsbn(value) {
     const isbn = validIsbn(value);
@@ -130,11 +144,11 @@ function createIsbnResearch({ search, fetchPage }) {
     const values = [...sources.values()];
     const title = consensus(values, 'title') || values.find(source => source.title)?.title;
     if (!title) return { found: false, message: "Bu ISBN ile eşleşen kitap bilgisi internet kaynaklarında doğrulanamadı." };
-    // Core bibliographic fields require independent websites to agree; never ask an LLM to fill gaps.
-    const author = consensus(values, 'author'), publisher = resolvedPublisher(values), pageCount = consensus(values, 'pageCount');
+    // Prefer agreement; if sources differ, select the strongest ISBN-matched evidence rather than erase available data.
+    const author = bestSourcedValue(values, 'author'), publisher = bestSourcedValue(values, 'publisher'), pageCount = bestSourcedValue(values, 'pageCount');
     const publisherStem = publisherIdentity(publisher);
     const official = publisherStem && values.find(source => normalize(new URL(source.editionSource).hostname).includes(publisherStem));
-    return { found: true, sourceIsbn: isbn, title, author, publisher, pageCount, publishedDate: official?.publishYear || consensus(values, 'publishYear'), description: values.find(source => source.description)?.description || null, categories: [], editionSources: values.map(source => source.editionSource), missingFields: [!author && 'Yazar', !publisher && 'Yayınevi', !pageCount && 'Sayfa sayısı'].filter(Boolean) };
+    return { found: true, sourceIsbn: isbn, title, author, publisher, pageCount, publishedDate: official?.publishYear || bestSourcedValue(values, 'publishYear'), description: values.find(source => source.description)?.description || null, categories: [], editionSources: values.map(source => source.editionSource), missingFields: [!author && 'Yazar', !publisher && 'Yayınevi', !pageCount && 'Sayfa sayısı'].filter(Boolean) };
   };
 }
 module.exports.createIsbnResearch = createIsbnResearch;
