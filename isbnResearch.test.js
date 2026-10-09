@@ -17,6 +17,10 @@ assert.equal(parseEdition(publisherPage.replace('Stanley Rosenberg','Doç. Dr. T
 assert.equal(cleanDescription('Kitap AçıklamasıHepimiz öğreniyoruz.Bu kitap sorular soruyor.Kitap ÖzellikleriBarkod9786057365460Basım Yılı2022YazarSinan Canan'), 'Hepimiz öğreniyoruz.\n\nBu kitap sorular soruyor.');
 assert.equal(cleanDescription('<p>Birinci paragraf.</p><p>İkinci paragraf.</p><h2>Kitap Özellikleri</h2><p>Sayfa 552</p>'), 'Birinci paragraf.\n\nİkinci paragraf.');
 assert.equal(cleanDescription('Bir kitabın özellikleri üzerine bir hikâye.'), 'Bir kitabın özellikleri üzerine bir hikâye.');
+assert.equal(consensus([
+ {publisher:'Profil Kitap',editionSource:'https://one.test/book'},
+ {publisher:'Profil Yayıncılık',editionSource:'https://two.test/book'},
+], 'publisher'), 'Profil Kitap');
 async function check(secondPages) {
  const research=createIsbnResearch({search:async()=>({organic:[{link:'https://one.test/book'},{link:'https://two.test/book'}]}),fetchPage:async url=>({ok:true,text:async()=>html(url.includes('one.test')?192:secondPages)})});
  return research('9786259355948');

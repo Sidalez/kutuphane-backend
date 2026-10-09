@@ -52,11 +52,21 @@ function parseEdition(html, url, book = {}, expectedIsbn) {
   const author = authorName(name(schema?.author) || authorLabel || authorLink) || null;
   return { title, author, description: cleanDescription(schema?.description), isbn, publisher, pageCount: pages > 0 && pages < 10000 ? pages : null, publishYear: date.match(/(?:19|20)\d{2}/)?.[0] || null, editionSource: url };
 }
+const publisherIdentity = value => normalize(value).replace(/(?:yayinlari|yayinevi|yayincilik|yayin|kitap)$/, '');
+function resolvedPublisher(sources) {
+  const agreed = consensus(sources, 'publisher');
+  if (agreed) return agreed;
+  const candidates = sources.filter(source => source.publisher);
+  // A directly labelled publisher on an ISBN-matched page is evidence even
+  // when no second store exposes the field. Conflicting identities need more research.
+  const identities = new Set(candidates.map(source => publisherIdentity(source.publisher)));
+  return identities.size === 1 ? candidates[0].publisher : null;
+}
 function consensus(sources, field) {
   const groups = new Map();
   for (const source of sources) {
     if (source[field] == null) continue;
-    const key = field === 'publisher' ? normalize(source[field]).replace(/(?:yayinlari|yayinevi|yayincilik|yayin)$/, '') : normalize(field === 'author' ? authorName(source[field]) : source[field]);
+    const key = field === 'publisher' ? publisherIdentity(source[field]) : normalize(field === 'author' ? authorName(source[field]) : source[field]);
     if (!groups.has(key)) groups.set(key, { value: field === 'author' ? authorName(source[field]) : source[field], hosts: new Set() });
     groups.get(key).hosts.add(new URL(source.editionSource).hostname.replace(/^www\./, ''));
   }
@@ -96,7 +106,7 @@ function createIsbnResearch({ search, fetchPage }) {
     const isbn = validIsbn(value);
     if (!isbn) return { found: false, message: "Geçerli bir ISBN-13 girilmelidir." };
     const sources = new Map();
-    for (const suffix of ["kitap yazar yayınevi sayfa", "ISBN yazar sayfa sayısı"]) {
+    for (const suffix of ["kitap yazar yayınevi sayfa", "ISBN yazar sayfa sayısı", "yayınevi yayıncı marka"]) {
       const result = await search(`"${isbn}" ${suffix}`);
       const links = [...new Set((result.organic || []).map(item => item.link))].filter(link => /^https:\/\//.test(link) && !sources.has(link)).slice(0, 8);
       await Promise.all(links.map(async link => {
@@ -108,14 +118,14 @@ function createIsbnResearch({ search, fetchPage }) {
         } catch {}
       }));
       const values = [...sources.values()];
-      if (consensus(values, 'author') && consensus(values, 'publisher') && consensus(values, 'pageCount')) break;
+      if (consensus(values, 'author') && resolvedPublisher(values) && consensus(values, 'pageCount')) break;
     }
     const values = [...sources.values()];
     const title = consensus(values, 'title') || values.find(source => source.title)?.title;
     if (!title) return { found: false, message: "Bu ISBN ile eşleşen kitap bilgisi internet kaynaklarında doğrulanamadı." };
     // Core bibliographic fields require independent websites to agree; never ask an LLM to fill gaps.
-    const author = consensus(values, 'author'), publisher = consensus(values, 'publisher'), pageCount = consensus(values, 'pageCount');
-    const publisherStem = normalize(publisher).replace(/(?:yayinlari|yayinevi|yayincilik|yayin)$/, '');
+    const author = consensus(values, 'author'), publisher = resolvedPublisher(values), pageCount = consensus(values, 'pageCount');
+    const publisherStem = publisherIdentity(publisher);
     const official = publisherStem && values.find(source => normalize(new URL(source.editionSource).hostname).includes(publisherStem));
     return { found: true, sourceIsbn: isbn, title, author, publisher, pageCount, publishedDate: official?.publishYear || consensus(values, 'publishYear'), description: values.find(source => source.description)?.description || null, categories: [], editionSources: values.map(source => source.editionSource), missingFields: [!author && 'Yazar', !publisher && 'Yayınevi', !pageCount && 'Sayfa sayısı'].filter(Boolean) };
   };
