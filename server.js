@@ -419,7 +419,7 @@ async function getBookEditionEvidence(isbn) {
       const text = cleanText(html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
         .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " "));
       const pageMatch = text.match(/Sayfa\s*Sayısı\s*:?\s*(\d{1,4})\b/i);
-      const publisherMatch = text.match(/(?:Yayınevi|YAYINEVİ)\s*:\s*(.{2,100}?)(?=\s+(?:Yazar|Barkod|ISBN|Sayfa|Boyut|Çevirmen|Kategori)\s*:)/i);
+      const publisherMatch = text.match(/(?:Yayınevi|YAYINEVİ)\s*:\s*(.{2,100}?)(?=\s+(?:Yazar|Barkod|ISBN|Sayfa(?: Sayısı)?|Boyut|Çevirmen|Kategori)\s*:)/i);
       let publisher = publisherMatch ? cleanText(publisherMatch[1]) : null;
       // JSON-LD can contain publisher metadata even when the visible label differs.
       for (const match of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
@@ -2362,6 +2362,58 @@ async function getDiscoverySuggestions(payload) {
 // SERVER
 // ----------------------------------------------------------------
 
+async function getSuggestedBookEdition(book) {
+  if (!book.title || !book.author) return {};
+  const search = await serperRequest("search", {
+    q: `"${book.title}" "${book.author}" ISBN sayfa yayınevi`, gl: "tr", hl: "tr", num: 5,
+  });
+  const normalize = (value) => cleanText(value).toLocaleLowerCase("tr-TR").replace(/[^\p{L}\p{N}]/gu, "");
+  const editions = await Promise.all((search.organic || []).slice(0, 3).map(async (item) => {
+    try {
+      const url = new URL(item.link);
+      if (url.protocol !== "https:") return null;
+      const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
+      if (!response.ok) return null;
+      const html = await response.text();
+      const text = cleanText(html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ").replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " "));
+      if (!normalize(text).includes(normalize(book.title)) || !normalize(text).includes(normalize(book.author))) return null;
+      let schema = null;
+      for (const match of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+        try {
+          const visit = (value) => {
+            if (!value || typeof value !== "object") return;
+            const author = Array.isArray(value.author) ? value.author.map(a => a.name || a).join(" ") : value.author?.name || value.author;
+            if (normalize(value.name) === normalize(book.title) && normalize(author).includes(normalize(book.author)) && value.isbn) schema = value;
+            Object.values(value).forEach(visit);
+          };
+          visit(JSON.parse(match[1]));
+        } catch {}
+      }
+      const isbnMatch = text.match(/(?:ISBN(?:-13)?|Barkod|Stok Kodu|Ürün Kodu)\s*:?\s*(97[89](?:[\s-]?\d){10})\b/i);
+      const isbn = cleanIsbn(schema?.isbn || isbnMatch?.[1]);
+      if (!/^97[89]\d{10}$/.test(isbn)) return null;
+      const publisherMatch = text.match(/Yayınevi\s*:\s*(.{2,100}?)(?=\s+(?:Yazar|Barkod|ISBN|Sayfa(?: Sayısı)?|Boyut|Çevirmen|Kategori)\s*:)/i);
+      const publisher = cleanText(typeof schema?.publisher === "string" ? schema.publisher : schema?.publisher?.name || publisherMatch?.[1]) || null;
+      const pages = text.match(/Sayfa\s*Sayısı\s*:?\s*(\d{1,4})\b/i);
+      const date = text.match(/(?:Yayın Tarihi|Basım Tarihi|Basım Yılı|Basım yılı|Basım tarihi|Yayın Yılı|Çıkış Tarihi)\s*:?\s*((?:\d{1,2}[./-]){0,2}(?:19|20)\d{2}(?:-\d{2})?)/i);
+      const year = String(schema?.datePublished || date?.[1] || "").match(/(?:19|20)\d{2}/)?.[0] || null;
+      return { isbn, publisher, pageCount: parseNumberOrNull(schema?.numberOfPages || pages?.[1]), publishYear: year, editionSource: item.link };
+    } catch { return null; }
+  }));
+  // Keep all fields tied to one ISBN/product page; never combine different editions.
+  const edition = editions.filter(Boolean).sort((a, b) => [b.publisher, b.pageCount, b.publishYear].filter(Boolean).length - [a.publisher, a.pageCount, a.publishYear].filter(Boolean).length)[0];
+  if (!edition) return {};
+  try {
+    const verified = await getBookEditionEvidence(edition.isbn);
+    const agreeing = verified.sources.filter(source => source.pageCount != null && source.pageCount === verified.pageCount);
+    // A single product page can contain a typo; require agreement for page counts.
+    edition.pageCount = agreeing.length >= 2 ? verified.pageCount : null;
+    if (verified.publisher) edition.publisher = verified.publisher;
+    edition.editionSources = [edition.editionSource, ...agreeing.map(source => source.url)];
+  } catch { edition.pageCount = null; }
+  return edition;
+}
+
 async function recommendBooks(payload) {
   const goal = payload.goal || "choose_library_book";
   if (!["choose_library_book", "choose_new_book"].includes(goal)) {
@@ -2374,7 +2426,7 @@ async function recommendBooks(payload) {
     .slice(0, 100)
     .map((book, index) => ({
       candidateId: index, title: cleanText(book.title), author: cleanText(book.author),
-      totalPages: book.totalPages, pagesRead: book.pagesRead,
+      totalPages: book.totalPages, pagesRead: book.pagesRead, publisher: cleanText(book.publisher), publishYear: cleanText(book.publishYear), isbn: cleanIsbn(book.isbn),
       status: book.status, categories: book.categories,
       expectedRating: book.expectedRating, progressRating: book.progressRating,
     }));
@@ -2414,17 +2466,19 @@ Yalnızca şu JSON'u döndür:
     if (!title || seen.has(key)) return [];
     seen.add(key);
     if (suggestedBooks.length >= 3) return [];
-    suggestedBooks.push({ title, author, genre: cleanText(item.genre), summary: cleanText(item.summary), reason: cleanText(item.reason) });
+    suggestedBooks.push({ title, author, genre: cleanText(item.genre), summary: cleanText(item.summary), reason: cleanText(item.reason), ...(book ? { publisher: book.publisher, pageCount: book.totalPages, publishYear: book.publishYear, isbn: book.isbn } : {}) });
     const field = (value) => cleanText(value).replace(/\|/g, ",");
     return [`- Kitap: ${field(title)} | Yazar: ${field(author)} | Tür: ${field(item.genre)} | Özet: ${field(item.summary)} | Neden: ${field(item.reason)}`];
   }).slice(0, 3);
   if (!items.length) throw new Error("Uygun kitap önerisi oluşturulamadı. Tercihlerini değiştirip tekrar dene.");
   if (goal === "choose_new_book") {
     await Promise.all(suggestedBooks.map(async (book) => {
-      try {
+      await Promise.all([ (async () => { try {
         const image = await getFirstSerperImageUrl(`${book.title} ${book.author} kitap kapağı`);
         if (image.firstResult) book.coverImageUrl = image.imageUrl;
-      } catch (error) { console.warn("Öneri kapağı alınamadı:", error.message); }
+      } catch (error) { console.warn("Öneri kapağı alınamadı:", error.message); } })(),
+      (async () => { try { Object.assign(book, await getSuggestedBookEdition(book)); }
+      catch (error) { console.warn("Öneri baskı bilgileri alınamadı:", error.message); } })() ]);
     }));
   }
   const text = ["Kısa Profil Özeti", `- ${cleanText(result.profile) || "Tercihlerine göre kitaplar seçildi."}`,
