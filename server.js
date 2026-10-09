@@ -190,14 +190,27 @@ function cleanSeedTitle(title) {
 // GEMINI
 // ----------------------------------------------------------------
 
+const openRouterCache = new Map();
 async function callOpenRouter(prompt, temperature = 0.3) {
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  const cacheKey = require("crypto").createHash("sha256").update(JSON.stringify([OPENROUTER_MODEL, prompt, temperature])).digest("hex");
+  const cached = openRouterCache.get(cacheKey);
+  if (cached && cached.expires > Date.now()) return cached.text;
+  let response, data;
+  try {
+  response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
-    signal: AbortSignal.timeout(90000),
+    signal: AbortSignal.timeout(45000),
     headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({ model: OPENROUTER_MODEL, messages: [{ role: "system", content: "Türkçe ve açık yaz. İstenen JSON biçimine uy. Bu çağrıda web arama aracın yok; araştırma yaptığını iddia etme. Verilen kaynaklara dayan, bilinmeyen baskı bilgilerini uydurma." }, { role: "user", content: prompt }], temperature, max_tokens: 8000 }),
   });
-  const data = await response.json();
+  data = await response.json();
+  } catch (cause) {
+    const timedOut = cause.name === "TimeoutError" || cause.name === "AbortError";
+    const error = new Error(timedOut ? "Ücretsiz yapay zekâ modeli zamanında yanıt vermedi. Bir süre sonra tekrar deneyebilir ya da ‘Rafımdan seç’ ile kütüphanenden öneri alabilirsin." : "Yapay zekâ servisine şu anda bağlanılamıyor. Lütfen tekrar dene.");
+    error.status = timedOut ? 504 : 503;
+    error.code = timedOut ? "AI_TIMEOUT" : "AI_UNAVAILABLE";
+    throw error;
+  }
   if (!response.ok || data.error) {
     const status = data.error?.code || response.status;
     const message = status === 429 ? "Ücretsiz OpenRouter modellerinin kullanım sınırına ulaşıldı veya servis yoğun. Bir süre sonra tekrar deneyebilir ya da ‘Rafımdan seç’ seçeneğini kullanabilirsin." : status === 401 ? "OpenRouter API anahtarı geçersiz. Backend ortam ayarını kontrol et." : "OpenRouter şu anda yanıt veremiyor. Lütfen tekrar dene.";
@@ -210,6 +223,8 @@ async function callOpenRouter(prompt, temperature = 0.3) {
   if (typeof text !== "string" || !text.trim() || data.choices?.[0]?.finish_reason === "length") {
     throw new Error("Ücretsiz model tamamlanmış bir yanıt üretemedi. Lütfen tekrar dene.");
   }
+  if (openRouterCache.size >= 100) openRouterCache.delete(openRouterCache.keys().next().value);
+  openRouterCache.set(cacheKey, { text: text.trim(), expires: Date.now() + 30 * 60 * 1000 });
   return text.trim();
 }
 
@@ -2492,7 +2507,7 @@ Yalnızca şu JSON'u döndür:
   try {
     raw = await callGemini({ prompt, temperature: 0.3, googleSearch: goal === "choose_new_book" });
   } catch (error) {
-    if (error.status !== 429 || goal !== "choose_library_book") throw error;
+    if (![429, 502, 503, 504].includes(error.status) || goal !== "choose_library_book") throw error;
     const preferences = normalizeSuggestionText(context.preferenceText);
     const ranked = candidates.map(book => {
       const categories = Array.isArray(book.categories) ? book.categories : [];
@@ -2507,7 +2522,7 @@ Yalnızca şu JSON'u döndür:
       summary: "",
       reason: [book.status === "OKUNUYOR" ? "Okumaya başladığın bu kitaba kaldığın yerden devam edebilirsin." : "Kütüphanende okunmayı bekliyor.", matches.length ? `Tercihinle eşleşen tür: ${matches.join(", ")}.` : "", book.expectedRating ? "Beklenti puanın da seçimde dikkate alındı." : ""].filter(Boolean).join(" "),
     }));
-    return { source: "library_rules", books, text: ["Kısa Profil Özeti", "- AI kotası dolduğu için bu seçimler kütüphanendeki durum, puan ve tür bilgilerine göre hazırlandı.", "Kesinlikle Başlaman Gerekenler", ...books.map(book => `- Kitap: ${book.title} | Yazar: ${book.author} | Neden: ${book.reason}`)].join("\n") };
+    return { source: "library_rules", books, text: ["Kısa Profil Özeti", "- AI servisine erişilemediği için bu seçimler kütüphanendeki durum, puan ve tür bilgilerine göre hazırlandı.", "Kesinlikle Başlaman Gerekenler", ...books.map(book => `- Kitap: ${book.title} | Yazar: ${book.author} | Neden: ${book.reason}`)].join("\n") };
   }
   const result = parseJsonFromText(raw, null);
   if (!result || !Array.isArray(result.recommendations)) throw new Error("Öneriler okunamadı. Lütfen tekrar dene.");
