@@ -2,7 +2,7 @@
 // Node 18+ gerektirir.
 // Kitap: ISBN -> Serper Images ilk title + ilk imageUrl -> Gemini detayları
 // Film/Dizi: TMDb search + TMDb details + TV season episodes
-// AI: OpenRouter ücretsiz modeller (anahtar varsa), aksi halde Gemini.
+// AI: Groq, OpenRouter veya Gemini (sunucu ortam ayarlarına göre).
 
 const path = require("path");
 
@@ -20,11 +20,14 @@ function normalizeEnvValue(value) {
 
 const GEMINI_API_KEY = normalizeEnvValue(process.env.GEMINI_API_KEY);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GROQ_API_KEY = normalizeEnvValue(process.env.GROQ_API_KEY);
+const GROQ_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-20b";
 const OPENROUTER_API_KEY = normalizeEnvValue(process.env.OPENROUTER_API_KEY);
 const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
 if (OPENROUTER_MODEL !== "openrouter/free" && !OPENROUTER_MODEL.endsWith(":free")) {
   throw new Error("OpenRouter için yalnızca ücretsiz modeller kullanılabilir.");
 }
+const AI_PROVIDER = GROQ_API_KEY ? "groq" : OPENROUTER_API_KEY ? "openrouter" : "gemini";
 const SERPER_API_KEY = normalizeEnvValue(process.env.SERPER_API_KEY);
 
 const TMDB_ACCESS_TOKEN = normalizeEnvValue(process.env.TMDB_ACCESS_TOKEN);
@@ -39,8 +42,8 @@ const PORT = process.env.PORT || 3001;
 const NO_PHOTO_URL =
   "https://cdn.vectorstock.com/i/500p/33/47/no-photo-available-icon-vector-40343347.jpg";
 
-if (!GEMINI_API_KEY && !OPENROUTER_API_KEY) {
-  console.error("❌ GEMINI_API_KEY bulunamadı. .env dosyasını kontrol et.");
+if (!GEMINI_API_KEY && !OPENROUTER_API_KEY && !GROQ_API_KEY) {
+  console.error("❌ Yapay zekâ API anahtarı bulunamadı. .env dosyasını kontrol et.");
   process.exit(1);
 }
 
@@ -53,7 +56,7 @@ if (!TMDB_ACCESS_TOKEN) {
   console.warn("⚠️ TMDB_ACCESS_TOKEN bulunamadı. Medya endpointleri çalışmaz.");
 }
 
-console.log("AI sağlayıcısı:", OPENROUTER_API_KEY ? `OpenRouter (${OPENROUTER_MODEL})` : "Gemini");
+console.log("AI sağlayıcısı:", GROQ_API_KEY ? `Groq (${GROQ_MODEL})` : OPENROUTER_API_KEY ? `OpenRouter (${OPENROUTER_MODEL})` : "Gemini");
 console.log("🤖 Gemini model:", GEMINI_MODEL);
 console.log("🖼️ Serper key okundu:", SERPER_API_KEY.slice(0, 8) + "...");
 console.log("🎬 TMDb token:", TMDB_ACCESS_TOKEN ? "okundu" : "eksik");
@@ -192,16 +195,20 @@ function cleanSeedTitle(title) {
 
 const openRouterCache = new Map();
 async function callOpenRouter(prompt, temperature = 0.3) {
-  const cacheKey = require("crypto").createHash("sha256").update(JSON.stringify([OPENROUTER_MODEL, prompt, temperature])).digest("hex");
+  const providerName = GROQ_API_KEY ? "Groq" : "OpenRouter";
+  const model = GROQ_API_KEY ? GROQ_MODEL : OPENROUTER_MODEL;
+  const apiKey = GROQ_API_KEY || OPENROUTER_API_KEY;
+  const endpoint = GROQ_API_KEY ? "https://api.groq.com/openai/v1/chat/completions" : "https://openrouter.ai/api/v1/chat/completions";
+  const cacheKey = require("crypto").createHash("sha256").update(JSON.stringify([AI_PROVIDER, model, prompt, temperature])).digest("hex");
   const cached = openRouterCache.get(cacheKey);
   if (cached && cached.expires > Date.now()) return cached.text;
   let response, data;
   try {
-  response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  response = await fetch(endpoint, {
     method: "POST",
     signal: AbortSignal.timeout(45000),
-    headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: OPENROUTER_MODEL, messages: [{ role: "system", content: "Türkçe ve açık yaz. İstenen JSON biçimine uy. Bu çağrıda web arama aracın yok; araştırma yaptığını iddia etme. Verilen kaynaklara dayan, bilinmeyen baskı bilgilerini uydurma." }, { role: "user", content: prompt }], temperature, max_tokens: 8000 }),
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model, ...(GROQ_API_KEY ? { reasoning_effort: "low" } : {}), messages: [{ role: "system", content: "Türkçe ve açık yaz. İstenen JSON biçimine uy. Bu çağrıda web arama aracın yok; araştırma yaptığını iddia etme. Verilen kaynaklara dayan, bilinmeyen baskı bilgilerini uydurma." }, { role: "user", content: prompt }], temperature, max_tokens: 8000 }),
   });
   data = await response.json();
   } catch (cause) {
@@ -212,8 +219,8 @@ async function callOpenRouter(prompt, temperature = 0.3) {
     throw error;
   }
   if (!response.ok || data.error) {
-    const status = data.error?.code || response.status;
-    const message = status === 429 ? "Ücretsiz OpenRouter modellerinin kullanım sınırına ulaşıldı veya servis yoğun. Bir süre sonra tekrar deneyebilir ya da ‘Rafımdan seç’ seçeneğini kullanabilirsin." : status === 401 ? "OpenRouter API anahtarı geçersiz. Backend ortam ayarını kontrol et." : "OpenRouter şu anda yanıt veremiyor. Lütfen tekrar dene.";
+    const status = response.ok ? 502 : response.status;
+    const message = status === 429 ? ` ${providerName} kullanım sınırına ulaşıldı veya servis yoğun. Bir süre sonra tekrar deneyebilir ya da ‘Rafımdan seç’ seçeneğini kullanabilirsin.`.trim() : status === 401 ? `${providerName} API anahtarı geçersiz. Backend ortam ayarını kontrol et.` : `${providerName} şu anda yanıt veremiyor. Lütfen tekrar dene.`;
     const error = new Error(message);
     error.status = status;
     error.code = status === 429 ? "AI_QUOTA_EXCEEDED" : "AI_PROVIDER_ERROR";
@@ -247,7 +254,7 @@ async function callGemini({
   temperature = 0.35,
   googleSearch = true,
 }) {
-  if (OPENROUTER_API_KEY) return callOpenRouter(prompt, temperature);
+  if (GROQ_API_KEY || OPENROUTER_API_KEY) return callOpenRouter(prompt, temperature);
   async function sendRequest(useSearch) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
@@ -1555,7 +1562,7 @@ function safeJsonParseFromGemini(text) {
 }
 
 async function callGeminiJson(prompt) {
-  if (OPENROUTER_API_KEY) return safeJsonParseFromGemini(await callOpenRouter(prompt));
+  if (GROQ_API_KEY || OPENROUTER_API_KEY) return safeJsonParseFromGemini(await callOpenRouter(prompt));
   const apiKey = getGeminiApiKeySafe();
 
   if (!apiKey) {
@@ -1643,7 +1650,7 @@ ${JSON.stringify(details, null, 2)}
 async function aiEnhanceSuggestionsWithGemini({ suggestions, payload, history }) {
   const apiKey = getGeminiApiKeySafe();
 
-  if ((!apiKey && !OPENROUTER_API_KEY) || !Array.isArray(suggestions) || suggestions.length === 0) {
+  if ((!apiKey && !OPENROUTER_API_KEY && !GROQ_API_KEY) || !Array.isArray(suggestions) || suggestions.length === 0) {
     return suggestions;
   }
 
@@ -2500,7 +2507,7 @@ ${JSON.stringify(context)}
 choose_library_book hedefinde SADECE candidateBooks içindeki kitapları seç ve candidateId değerlerini döndür.
 choose_new_book hedefinde gerçek, Türkçede bulunabilen kitaplar öner; sampleBooks ve candidateBooks içindekileri tekrar önerme.
 Kitapların baskısı belli olmadığı için yayınevi, sayfa sayısı veya ISBN tahmin etme.
-Özet ve gerekçeleri kısa tut, neden bu kullanıcıya uygun olduğunu açıkla. Ton: ${context.tone}.
+Ayırdığı süre bir okuma oturumudur; kitabı bu sürede bitirebileceğini iddia etme. Özet ve gerekçeleri kısa tut, neden bu kullanıcıya uygun olduğunu açıkla. Ton: ${context.tone}.
 Yalnızca şu JSON'u döndür:
 {"profile":"Kısa profil yorumu","strategy":"Öneri stratejisi","recommendations":[{"candidateId":0,"title":"Kitap adı","author":"Yazar","genre":"Tür","summary":"Kısa konu, spoiler yok","reason":"Kişiye özel gerekçe"}]}`;
   let raw;
@@ -2594,7 +2601,8 @@ const server = http.createServer(async (req, res) => {
         success: true,
         message: "Backend çalışıyor.",
         services: {
-          aiProvider: OPENROUTER_API_KEY ? "openrouter" : "gemini",
+          aiProvider: AI_PROVIDER,
+          groq: Boolean(GROQ_API_KEY),
           openrouter: Boolean(OPENROUTER_API_KEY),
           gemini: Boolean(GEMINI_API_KEY),
           serper: Boolean(SERPER_API_KEY),
