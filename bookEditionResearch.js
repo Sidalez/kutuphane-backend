@@ -1,4 +1,4 @@
-const normalize = value => String(value || '').toLocaleLowerCase('tr-TR').normalize('NFD').replace(/\p{M}/gu, '').replace(/[^\p{L}\p{N}]/gu, '');
+const normalize = value => String(value || '').toLocaleLowerCase('tr-TR').normalize('NFD').replace(/\p{M}/gu, '').replace(/ı/g, 'i').replace(/[^\p{L}\p{N}]/gu, '');
 const plain = html => String(html || '').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' ').replace(/&nbsp;|&#160;/gi, ' ').replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/\s+/g, ' ').trim();
 function validIsbn(value) {
   const isbn = String(value || '').replace(/[^\d]/g, '');
@@ -26,13 +26,17 @@ function parseEdition(html, url, book = {}, expectedIsbn) {
   const publisher = plain(name(schema?.publisher) || name(schema?.brand) || publisherLabel) || null;
   const pages = Number(schema?.numberOfPages || text.match(/(?:Sayfa\s*(?:Sayısı|Adedi)|Sayfa)\s*:?\s*(\d{1,4})\b/i)?.[1]);
   const date = String(schema?.datePublished || text.match(/(?:Yayın Tarihi|Yayımlanma Tarihi|Basım Tarihi|Basım Yılı|Yayın Yılı|Çıkış Tarihi)\s*:?\s*((?:\d{1,2}[./-]){0,2}(?:19|20)\d{2}(?:-\d{2})?)/i)?.[1] || '');
-  return { isbn, publisher, pageCount: pages > 0 && pages < 10000 ? pages : null, publishYear: date.match(/(?:19|20)\d{2}/)?.[0] || null, editionSource: url };
+  const authorLabel = text.match(/(?:Yazar(?:ı)?|Eser Sahibi)\s*:\s*(.{2,100}?)(?=\s+(?:Yayınevi|Yayıncı|Barkod|ISBN|Sayfa|Boyut|Çevirmen|Kategori|Dil|Yayın|Basım|Cilt|Kağıt|Kâğıt|Kapak|Ürün|Stok|Orijinal)\b|$)/i)?.[1];
+  const authorLink = [...html.matchAll(/<a\b[^>]*href=["'][^"']*\/yazar\/[^"']+["'][^>]*>([\s\S]*?)<\/a>/gi)].map(match => plain(match[1])).find(Boolean);
+  const title = plain(schema?.name || html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1]) || null;
+  const author = plain(name(schema?.author) || authorLabel || authorLink) || null;
+  return { title, author, description: plain(schema?.description) || null, isbn, publisher, pageCount: pages > 0 && pages < 10000 ? pages : null, publishYear: date.match(/(?:19|20)\d{2}/)?.[0] || null, editionSource: url };
 }
 function consensus(sources, field) {
   const groups = new Map();
   for (const source of sources) {
     if (source[field] == null) continue;
-    const key = normalize(source[field]);
+    const key = field === 'publisher' ? normalize(source[field]).replace(/(?:yayinlari|yayinevi|yayincilik|yayin)$/, '') : normalize(source[field]);
     if (!groups.has(key)) groups.set(key, { value: source[field], hosts: new Set() });
     groups.get(key).hosts.add(new URL(source.editionSource).hostname.replace(/^www\./, ''));
   }
@@ -66,3 +70,32 @@ function createEditionResearch({ search, fetchPage }) {
   };
 }
 module.exports = { validIsbn, parseEdition, consensus, createEditionResearch };
+
+function createIsbnResearch({ search, fetchPage }) {
+  return async function researchIsbn(value) {
+    const isbn = validIsbn(value);
+    if (!isbn) return { found: false, message: "Geçerli bir ISBN-13 girilmelidir." };
+    const sources = new Map();
+    for (const suffix of ["kitap yazar yayınevi sayfa", "ISBN yazar sayfa sayısı"]) {
+      const result = await search(`"${isbn}" ${suffix}`);
+      const links = [...new Set((result.organic || []).map(item => item.link))].filter(link => /^https:\/\//.test(link) && !sources.has(link)).slice(0, 8);
+      await Promise.all(links.map(async link => {
+        try {
+          const response = await fetchPage(link, { signal: AbortSignal.timeout(8000) });
+          if (!response.ok) return;
+          const edition = parseEdition(await response.text(), link, {}, isbn);
+          if (edition) sources.set(link, edition);
+        } catch {}
+      }));
+      const values = [...sources.values()];
+      if (consensus(values, 'author') && consensus(values, 'publisher') && consensus(values, 'pageCount')) break;
+    }
+    const values = [...sources.values()];
+    const title = consensus(values, 'title') || values.find(source => source.title)?.title;
+    if (!title) return { found: false, message: "Bu ISBN ile eşleşen kitap bilgisi internet kaynaklarında doğrulanamadı." };
+    // Core bibliographic fields require independent websites to agree; never ask an LLM to fill gaps.
+    const author = consensus(values, 'author'), publisher = consensus(values, 'publisher'), pageCount = consensus(values, 'pageCount');
+    return { found: true, sourceIsbn: isbn, title, author, publisher, pageCount, publishedDate: consensus(values, 'publishYear'), description: values.find(source => source.description)?.description || null, categories: [], editionSources: values.map(source => source.editionSource), missingFields: [!author && 'Yazar', !publisher && 'Yayınevi', !pageCount && 'Sayfa sayısı'].filter(Boolean) };
+  };
+}
+module.exports.createIsbnResearch = createIsbnResearch;

@@ -1,7 +1,7 @@
 const fs=require('fs'),vm=require('vm'),assert=require('node:assert/strict');
 const source=fs.readFileSync('server.js','utf8').split('\nconst server = http.createServer')[0];
 function setup() {
-  const context={require:id=>id==='./bookEditionResearch'?{createEditionResearch:()=>async book=>book.title.startsWith('Valid')?{isbn:'9786053756040',editionSource:'https://source.test/'+book.title}:{}}:require(id),__dirname:process.cwd(),process,console:{log(){},warn(){},error(){}},fetch,AbortSignal,Map,URL};
+  const context={require:id=>id==='./bookEditionResearch'?{createIsbnResearch:()=>async()=>({found:false}),createEditionResearch:()=>async book=>book.title.startsWith('Valid')?{isbn:'9786053756040',editionSource:'https://source.test/'+book.title}:{}}:require(id),__dirname:process.cwd(),process,console:{log(){},warn(){},error(){}},fetch,AbortSignal,Map,URL};
   vm.createContext(context);vm.runInContext(source,context);vm.runInContext('serperRequest=async()=>({organic:[]});getFirstSerperImageUrl=async()=>({});',context);return context;
 }
 (async()=>{

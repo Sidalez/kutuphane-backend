@@ -461,162 +461,10 @@ async function findCoverWithSerperImage({ isbn, title, author, publisher }) {
 // KITAP
 // ----------------------------------------------------------------
 
-async function getBookEditionEvidence(isbn) {
-  const search = await serperRequest("search", {
-    q: `"${isbn}" yayınevi "sayfa"`, gl: "tr", hl: "tr", num: 5,
-  });
-  const results = await Promise.all((search.organic || []).slice(0, 5).map(async (item) => {
-    try {
-      const url = new URL(item.link);
-      if (url.protocol !== "https:") return null;
-      const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
-      if (!response.ok) return null;
-      const html = await response.text();
-      // Only accept edition metadata from pages explicitly containing the requested ISBN.
-      if (!html.includes(isbn)) return null;
-      const text = cleanText(html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
-        .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " "));
-      const pageMatch = text.match(/Sayfa\s*Sayısı\s*:?\s*(\d{1,4})\b/i);
-      const publisherMatch = text.match(/(?:Yayınevi|YAYINEVİ)\s*:\s*(.{2,100}?)(?=\s+(?:Yazar|Barkod|ISBN|Sayfa(?: Sayısı)?|Boyut|Çevirmen|Kategori)\s*:)/i);
-      let publisher = publisherMatch ? cleanText(publisherMatch[1]) : null;
-      // JSON-LD can contain publisher metadata even when the visible label differs.
-      for (const match of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
-        try {
-          const visit = (value) => {
-            if (!value || typeof value !== "object") return;
-            if (cleanIsbn(value.isbn) === isbn && value.publisher) {
-              const name = typeof value.publisher === "string" ? value.publisher : value.publisher.name;
-              if (typeof name === "string") publisher = cleanText(name);
-            }
-            Object.values(value).forEach(visit);
-          };
-          visit(JSON.parse(match[1]));
-        } catch {}
-      }
-      return { url: item.link, publisher, pageCount: pageMatch ? parseNumberOrNull(pageMatch[1]) : null };
-    } catch { return null; }
-  }));
-  const sources = results.filter(Boolean);
-  function agreedValue(field) {
-    const counts = new Map();
-    sources.forEach((source) => {
-      const value = source[field];
-      if (value != null) counts.set(value, (counts.get(value) || 0) + 1);
-    });
-    const ranked = [...counts].sort((a, b) => b[1] - a[1]);
-    if (!ranked.length || (ranked[1] && ranked[0][1] === ranked[1][1])) return null;
-    return ranked[0][0];
-  }
-  return { publisher: agreedValue("publisher"), pageCount: agreedValue("pageCount"), sources };
-}
-
-async function getBookDetailsFromGeminiBySerperTitle({ isbn, seed }) {
-  const clean = cleanIsbn(isbn);
-  const isbn10 = convertIsbn13to10(clean);
-  const edition = await getBookEditionEvidence(clean).catch((error) => {
-    console.warn("ISBN baskı bilgileri doğrulanamadı:", error.message);
-    return { publisher: null, pageCount: null, sources: [] };
-  });
-
-  const prompt = `
-Sen bir kitap veri çıkarma asistanısın.
-
-Aşağıdaki ISBN, Serper Images üzerinde "ISBN:${clean}" sorgusuyla arandı.
-Serper'ın ilk görsel sonucundan bir kitap başlığı ve kapak görseli elde edildi.
-Görevin bu başlığı ve ISBN bilgisini kullanarak kitabın alanlarını doğru şekilde doldurmaktır.
-
-ISBN-13: ${clean}
-ISBN-10: ${isbn10 || "Yok"}
-
-Bu ISBN'yi içeren ürün sayfalarından çıkarılan baskı bilgileri:
-${JSON.stringify(edition)}
-Baskı bilgileri için bu kaynakları esas al; farklı ISBN'li baskıların verilerini kullanma.
-
-Serper Images ilk sonucu:
-${JSON.stringify(
-  {
-    titleFromImageResult: seed.title,
-    imageSource: seed.source,
-    imageDomain: seed.domain,
-    imageLink: seed.link,
-    imageUrl: seed.imageUrl,
-  },
-  null,
-  2
-)}
-
-Google Search kullanarak bu kitabı araştır ve SADECE şu JSON formatında cevap ver:
-
-{
-  "found": boolean,
-  "sourceIsbn": "${clean}",
-  "title": "Kitap Adı",
-  "author": "Yazar Adı",
-  "publisher": "Yayınevi",
-  "pageCount": number,
-  "publishedDate": "Yıl veya tarih",
-  "description": "2-4 cümlelik Türkçe kısa özet",
-  "categories": ["Kategori 1", "Kategori 2"]
-}
-
-Kurallar:
-- Serper Images sonucundaki başlığı ana ipucu olarak kullan: "${seed.title}".
-- Başlığı tamamen farklı bir kitaba çevirme.
-- ISBN ile çelişen bir kitap bulursan found false döndür.
-- Yayınevi, sayfa sayısı ve yayın tarihi bulunamazsa null kullan.
-- Kapak görseli üretme; coverImageUrl alanı döndürme.
-- Link veya URL döndürme.
-- Markdown kullanma.
-- JSON dışında hiçbir şey yazma.
-`.trim();
-
-  const text = await callGemini({
-    prompt,
-    temperature: 0,
-    googleSearch: true,
-  });
-
-  const parsed = parseJsonFromText(text, { found: false });
-
-  const title =
-    typeof parsed.title === "string" && parsed.title.trim()
-      ? parsed.title.trim()
-      : seed.title;
-
-  const hasBasicBookData =
-    parsed?.found === true &&
-    typeof title === "string" &&
-    title.trim().length > 1;
-
-  if (!hasBasicBookData) {
-    return {
-      found: false,
-      message: "Gemini, Serper başlığından güvenilir kitap bilgisi çıkaramadı.",
-    };
-  }
-
-  return {
-    found: true,
-    sourceIsbn: clean,
-    title,
-    author:
-      typeof parsed.author === "string" && parsed.author.trim()
-        ? parsed.author.trim()
-        : null,
-    publisher: edition.publisher,
-    pageCount: edition.pageCount,
-    editionSources: edition.sources,
-    publishedDate:
-      typeof parsed.publishedDate === "string" && parsed.publishedDate.trim()
-        ? parsed.publishedDate.trim()
-        : null,
-    description:
-      typeof parsed.description === "string" && parsed.description.trim()
-        ? parsed.description.trim()
-        : null,
-    categories: Array.isArray(parsed.categories) ? parsed.categories : [],
-  };
-}
+const researchIsbnBook = require("./bookEditionResearch").createIsbnResearch({
+  search: q => serperRequest("search", { q, gl: "tr", hl: "tr", num: 10 }),
+  fetchPage: (...args) => fetch(...args),
+});
 
 // ----------------------------------------------------------------
 // TMDB HELPERS
@@ -2649,28 +2497,19 @@ const server = http.createServer(async (req, res) => {
 
       console.log("📚 ISBN isteği:", isbn);
 
-      const seed = await findBookSeedFromSerperImage(isbn);
-
-      if (!seed?.found) {
-        return json(res, 404, {
-          success: false,
-          message:
-            seed?.message ||
-            "ISBN için Serper Images üzerinde uygun kitap sonucu bulunamadı.",
-        });
-      }
-
-      const book = await getBookDetailsFromGeminiBySerperTitle({
-        isbn,
-        seed,
-      });
+      const { validIsbn } = require("./bookEditionResearch");
+      if (!validIsbn(isbn)) return json(res, 400, { success: false, message: "Geçerli bir ISBN-13 girilmelidir." });
+      const [book, seed] = await Promise.all([
+        researchIsbnBook(isbn),
+        findBookSeedFromSerperImage(isbn).catch(() => ({})),
+      ]);
 
       if (!book?.found) {
         return json(res, 404, {
           success: false,
           message:
             book?.message ||
-            "Gemini, bu ISBN için güvenilir kitap bilgisi çıkaramadı.",
+            "Bu ISBN için internet kaynaklarında doğrulanmış kitap bilgisi bulunamadı.",
         });
       }
 
@@ -2681,7 +2520,7 @@ const server = http.createServer(async (req, res) => {
           title: book.title,
           author: book.author,
           publisher: book.publisher,
-        }));
+        }).catch(() => null));
 
       return json(res, 200, {
         success: true,
