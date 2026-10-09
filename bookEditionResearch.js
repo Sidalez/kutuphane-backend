@@ -1,5 +1,21 @@
 const normalize = value => String(value || '').toLocaleLowerCase('tr-TR').normalize('NFD').replace(/\p{M}/gu, '').replace(/ı/g, 'i').replace(/[^\p{L}\p{N}]/gu, '');
 const plain = html => String(html || '').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' ').replace(/&nbsp;|&#160;/gi, ' ').replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/&(uuml|Uuml|ouml|Ouml|ccedil|Ccedil|scedil|Scedil|gbreve|Gbreve|imath|Idot);/g, (_, entity) => ({uuml:'ü',Uuml:'Ü',ouml:'ö',Ouml:'Ö',ccedil:'ç',Ccedil:'Ç',scedil:'ş',Scedil:'Ş',gbreve:'ğ',Gbreve:'Ğ',imath:'ı',Idot:'İ'}[entity])).replace(/\s+/g, ' ').trim();
+function cleanDescription(value) {
+  if (typeof value !== 'string') return null;
+  const blocks = value
+    .replace(/<br\s*\/?\s*>|<\/(?:p|div|li|h[1-6])>/gi, '\n')
+    .replace(/&bull;|&#8226;/gi, '• ')
+    .replace(/&#(\d+);/g, (_, number) => Number(number) <= 0x10ffff ? String.fromCodePoint(Number(number)) : '')
+    .replace(/&#x([0-9a-f]+);/gi, (_, number) => parseInt(number, 16) <= 0x10ffff ? String.fromCodePoint(parseInt(number, 16)) : '');
+  let text = blocks.split(/\n+/).map(plain).filter(Boolean).join('\n\n');
+  text = text.replace(/^\s*(?:Kitap Açıklaması|Ürün Açıklaması|Kitap Hakkında|Açıklama)\s*:?\s*/i, '');
+  // Some stores place their entire product panel inside schema.org description.
+  // Stop at the metadata heading, even if the store concatenates all its cells.
+  text = text.split(/(?:Kitap Özellikleri|Ürün Özellikleri|Teknik Özellikler|Kitap Künyesi|Ürün Künyesi|Künye)(?=\s|Barkod|ISBN|Yazar|Yayınevi|Basım|$)/i)[0];
+  text = text.replace(/(?:Barkod|ISBN(?:-13)?)\s*:?\s*97[89][\d\s-]{10,}[\s\S]*$/i, '');
+  text = text.replace(/([.!?])(?=[A-ZÇĞİÖŞÜ])/g, '$1\n\n').trim();
+  return text || null;
+}
 function validIsbn(value) {
   const isbn = String(value || '').replace(/[^\d]/g, '');
   return /^97[89]\d{10}$/.test(isbn) && [...isbn].reduce((sum, digit, i) => sum + Number(digit) * (i % 2 ? 3 : 1), 0) % 10 === 0 ? isbn : null;
@@ -34,7 +50,7 @@ function parseEdition(html, url, book = {}, expectedIsbn) {
   const ogTitle = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i)?.[1];
   const title = plain(schema?.name || book.searchTitle || ogTitle || html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1]).split(/\s+[|–-]\s+/)[0].trim() || null;
   const author = authorName(name(schema?.author) || authorLabel || authorLink) || null;
-  return { title, author, description: plain(schema?.description) || null, isbn, publisher, pageCount: pages > 0 && pages < 10000 ? pages : null, publishYear: date.match(/(?:19|20)\d{2}/)?.[0] || null, editionSource: url };
+  return { title, author, description: cleanDescription(schema?.description), isbn, publisher, pageCount: pages > 0 && pages < 10000 ? pages : null, publishYear: date.match(/(?:19|20)\d{2}/)?.[0] || null, editionSource: url };
 }
 function consensus(sources, field) {
   const groups = new Map();
@@ -73,7 +89,7 @@ function createEditionResearch({ search, fetchPage }) {
     return value;
   };
 }
-module.exports = { validIsbn, parseEdition, consensus, createEditionResearch };
+module.exports = { cleanDescription, validIsbn, parseEdition, consensus, createEditionResearch };
 
 function createIsbnResearch({ search, fetchPage }) {
   return async function researchIsbn(value) {
