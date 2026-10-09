@@ -1,5 +1,5 @@
 const normalize = value => String(value || '').toLocaleLowerCase('tr-TR').normalize('NFD').replace(/\p{M}/gu, '').replace(/ı/g, 'i').replace(/[^\p{L}\p{N}]/gu, '');
-const plain = html => String(html || '').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' ').replace(/&nbsp;|&#160;/gi, ' ').replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/\s+/g, ' ').trim();
+const plain = html => String(html || '').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' ').replace(/&nbsp;|&#160;/gi, ' ').replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/&(uuml|Uuml|ouml|Ouml|ccedil|Ccedil|scedil|Scedil|gbreve|Gbreve|imath|Idot);/g, (_, entity) => ({uuml:'ü',Uuml:'Ü',ouml:'ö',Ouml:'Ö',ccedil:'ç',Ccedil:'Ç',scedil:'ş',Scedil:'Ş',gbreve:'ğ',Gbreve:'Ğ',imath:'ı',Idot:'İ'}[entity])).replace(/\s+/g, ' ').trim();
 function validIsbn(value) {
   const isbn = String(value || '').replace(/[^\d]/g, '');
   return /^97[89]\d{10}$/.test(isbn) && [...isbn].reduce((sum, digit, i) => sum + Number(digit) * (i % 2 ? 3 : 1), 0) % 10 === 0 ? isbn : null;
@@ -22,13 +22,15 @@ function parseEdition(html, url, book = {}, expectedIsbn) {
   const labelled = [...text.matchAll(/(?:ISBN(?:\s*-?\s*13)?|Barkod|Stok Kodu|Ürün Kodu)\s*:?\s*(97[89](?:[\s-]?\d){10})\b/gi)].map(m => validIsbn(m[1])).filter(Boolean);
   const isbn = validIsbn(schema?.isbn || schema?.gtin13) || labelled[0];
   if (!isbn || (expectedIsbn && isbn !== expectedIsbn)) return null;
-  const publisherLabel = text.match(/(?:Yayınevi|Yayın Evi|Yayıncı)\s*:?\s*(.{2,100}?)(?=\s+(?:Yazar|Barkod|ISBN|Sayfa|Boyut|Çevirmen|Kategori|Dil|Yayın|Basım|Cilt|Kağıt|Kâğıt|Kapak|Ürün|Stok|Orijinal)\b|$)/i)?.[1];
-  const publisher = plain(name(schema?.publisher) || name(schema?.brand) || publisherLabel) || null;
+  const publisherLabel = text.match(/(?:Yayınevi|Yayın Evi|Yayıncı)\s*:\s*(.{2,100}?)(?=\s+(?:Tür|Yazar|Barkod|ISBN|Sayfa|Boyut|Çevirmen|Kategori|Dil|Yayın|Basım|Cilt|Kağıt|Kâğıt|Kapak|Ürün|Stok|Orijinal)\b|$)/i)?.[1];
+  const brandMeta = html.match(/<meta[^>]*property=["']product:brand["'][^>]*content=["']([^"']+)["']/i)?.[1];
+  const publisher = plain(name(schema?.publisher) || name(schema?.brand) || brandMeta || publisherLabel) || null;
   const pages = Number(schema?.numberOfPages || text.match(/(?:Sayfa\s*(?:Sayısı|Adedi)|Sayfa)\s*:?\s*(\d{1,4})\b/i)?.[1]);
-  const date = String(schema?.datePublished || text.match(/(?:Yayın Tarihi|Yayımlanma Tarihi|Basım Tarihi|Basım Yılı|Yayın Yılı|Çıkış Tarihi)\s*:?\s*((?:\d{1,2}[./-]){0,2}(?:19|20)\d{2}(?:-\d{2})?)/i)?.[1] || '');
+  const date = String(schema?.datePublished || text.match(/(?:Yayın Tarihi|Yayımlanma Tarihi|Basım Tarihi|Basım Yılı|Yayın Yılı|Çıkış Tarihi)\s*:?\s*((?:(?:Ocak|Şubat|Mart|Nisan|Mayıs|Haziran|Temmuz|Ağustos|Eylül|Ekim|Kasım|Aralık)\s+)?(?:\d{1,2}[./-]){0,2}(?:19|20)\d{2}(?:-\d{2})?)/i)?.[1] || '');
   const authorLabel = text.match(/(?:Yazar(?:ı)?|Eser Sahibi)\s*:\s*(.{2,100}?)(?=\s+(?:Yayınevi|Yayıncı|Barkod|ISBN|Sayfa|Boyut|Çevirmen|Kategori|Dil|Yayın|Basım|Cilt|Kağıt|Kâğıt|Kapak|Ürün|Stok|Orijinal)\b|$)/i)?.[1];
   const authorLink = [...html.matchAll(/<a\b[^>]*href=["'][^"']*\/yazar\/[^"']+["'][^>]*>([\s\S]*?)<\/a>/gi)].map(match => plain(match[1])).find(Boolean);
-  const title = plain(schema?.name || html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1]) || null;
+  const ogTitle = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i)?.[1];
+  const title = plain(schema?.name || book.searchTitle || ogTitle || html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1]).split(/\s+[|–-]\s+/)[0].trim() || null;
   const author = plain(name(schema?.author) || authorLabel || authorLink) || null;
   return { title, author, description: plain(schema?.description) || null, isbn, publisher, pageCount: pages > 0 && pages < 10000 ? pages : null, publishYear: date.match(/(?:19|20)\d{2}/)?.[0] || null, editionSource: url };
 }
@@ -83,7 +85,7 @@ function createIsbnResearch({ search, fetchPage }) {
         try {
           const response = await fetchPage(link, { signal: AbortSignal.timeout(8000) });
           if (!response.ok) return;
-          const edition = parseEdition(await response.text(), link, {}, isbn);
+          const edition = parseEdition(await response.text(), link, { searchTitle: (result.organic || []).find(item => item.link === link)?.title }, isbn);
           if (edition) sources.set(link, edition);
         } catch {}
       }));
@@ -95,7 +97,9 @@ function createIsbnResearch({ search, fetchPage }) {
     if (!title) return { found: false, message: "Bu ISBN ile eşleşen kitap bilgisi internet kaynaklarında doğrulanamadı." };
     // Core bibliographic fields require independent websites to agree; never ask an LLM to fill gaps.
     const author = consensus(values, 'author'), publisher = consensus(values, 'publisher'), pageCount = consensus(values, 'pageCount');
-    return { found: true, sourceIsbn: isbn, title, author, publisher, pageCount, publishedDate: consensus(values, 'publishYear'), description: values.find(source => source.description)?.description || null, categories: [], editionSources: values.map(source => source.editionSource), missingFields: [!author && 'Yazar', !publisher && 'Yayınevi', !pageCount && 'Sayfa sayısı'].filter(Boolean) };
+    const publisherStem = normalize(publisher).replace(/(?:yayinlari|yayinevi|yayincilik|yayin)$/, '');
+    const official = publisherStem && values.find(source => normalize(new URL(source.editionSource).hostname).includes(publisherStem));
+    return { found: true, sourceIsbn: isbn, title, author, publisher, pageCount, publishedDate: official?.publishYear || consensus(values, 'publishYear'), description: values.find(source => source.description)?.description || null, categories: [], editionSources: values.map(source => source.editionSource), missingFields: [!author && 'Yazar', !publisher && 'Yayınevi', !pageCount && 'Sayfa sayısı'].filter(Boolean) };
   };
 }
 module.exports.createIsbnResearch = createIsbnResearch;
