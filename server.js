@@ -2,7 +2,7 @@
 // Node 18+ gerektirir.
 // Kitap: ISBN -> Serper Images ilk title + ilk imageUrl -> Gemini detayları
 // Film/Dizi: TMDb search + TMDb details + TV season episodes
-// OpenAI / OpenRouter yoktur.
+// AI: OpenRouter ücretsiz modeller (anahtar varsa), aksi halde Gemini.
 
 const path = require("path");
 
@@ -20,6 +20,11 @@ function normalizeEnvValue(value) {
 
 const GEMINI_API_KEY = normalizeEnvValue(process.env.GEMINI_API_KEY);
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const OPENROUTER_API_KEY = normalizeEnvValue(process.env.OPENROUTER_API_KEY);
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
+if (OPENROUTER_MODEL !== "openrouter/free" && !OPENROUTER_MODEL.endsWith(":free")) {
+  throw new Error("OpenRouter için yalnızca ücretsiz modeller kullanılabilir.");
+}
 const SERPER_API_KEY = normalizeEnvValue(process.env.SERPER_API_KEY);
 
 const TMDB_ACCESS_TOKEN = normalizeEnvValue(process.env.TMDB_ACCESS_TOKEN);
@@ -34,7 +39,7 @@ const PORT = process.env.PORT || 3001;
 const NO_PHOTO_URL =
   "https://cdn.vectorstock.com/i/500p/33/47/no-photo-available-icon-vector-40343347.jpg";
 
-if (!GEMINI_API_KEY) {
+if (!GEMINI_API_KEY && !OPENROUTER_API_KEY) {
   console.error("❌ GEMINI_API_KEY bulunamadı. .env dosyasını kontrol et.");
   process.exit(1);
 }
@@ -48,7 +53,7 @@ if (!TMDB_ACCESS_TOKEN) {
   console.warn("⚠️ TMDB_ACCESS_TOKEN bulunamadı. Medya endpointleri çalışmaz.");
 }
 
-console.log("🔑 Gemini key okundu:", GEMINI_API_KEY.slice(0, 8) + "...");
+console.log("AI sağlayıcısı:", OPENROUTER_API_KEY ? `OpenRouter (${OPENROUTER_MODEL})` : "Gemini");
 console.log("🤖 Gemini model:", GEMINI_MODEL);
 console.log("🖼️ Serper key okundu:", SERPER_API_KEY.slice(0, 8) + "...");
 console.log("🎬 TMDb token:", TMDB_ACCESS_TOKEN ? "okundu" : "eksik");
@@ -185,6 +190,29 @@ function cleanSeedTitle(title) {
 // GEMINI
 // ----------------------------------------------------------------
 
+async function callOpenRouter(prompt, temperature = 0.3) {
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    signal: AbortSignal.timeout(90000),
+    headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: OPENROUTER_MODEL, messages: [{ role: "system", content: "Türkçe ve açık yaz. İstenen JSON biçimine uy. Bu çağrıda web arama aracın yok; araştırma yaptığını iddia etme. Verilen kaynaklara dayan, bilinmeyen baskı bilgilerini uydurma." }, { role: "user", content: prompt }], temperature, max_tokens: 8000 }),
+  });
+  const data = await response.json();
+  if (!response.ok || data.error) {
+    const status = data.error?.code || response.status;
+    const message = status === 429 ? "Ücretsiz OpenRouter modellerinin kullanım sınırına ulaşıldı veya servis yoğun. Bir süre sonra tekrar deneyebilir ya da ‘Rafımdan seç’ seçeneğini kullanabilirsin." : status === 401 ? "OpenRouter API anahtarı geçersiz. Backend ortam ayarını kontrol et." : "OpenRouter şu anda yanıt veremiyor. Lütfen tekrar dene.";
+    const error = new Error(message);
+    error.status = status;
+    error.code = status === 429 ? "AI_QUOTA_EXCEEDED" : "AI_PROVIDER_ERROR";
+    throw error;
+  }
+  const text = data.choices?.[0]?.message?.content;
+  if (typeof text !== "string" || !text.trim() || data.choices?.[0]?.finish_reason === "length") {
+    throw new Error("Ücretsiz model tamamlanmış bir yanıt üretemedi. Lütfen tekrar dene.");
+  }
+  return text.trim();
+}
+
 function extractGeminiText(data) {
   const parts = data?.candidates?.[0]?.content?.parts;
 
@@ -204,6 +232,7 @@ async function callGemini({
   temperature = 0.35,
   googleSearch = true,
 }) {
+  if (OPENROUTER_API_KEY) return callOpenRouter(prompt, temperature);
   async function sendRequest(useSearch) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
@@ -1511,6 +1540,7 @@ function safeJsonParseFromGemini(text) {
 }
 
 async function callGeminiJson(prompt) {
+  if (OPENROUTER_API_KEY) return safeJsonParseFromGemini(await callOpenRouter(prompt));
   const apiKey = getGeminiApiKeySafe();
 
   if (!apiKey) {
@@ -1598,7 +1628,7 @@ ${JSON.stringify(details, null, 2)}
 async function aiEnhanceSuggestionsWithGemini({ suggestions, payload, history }) {
   const apiKey = getGeminiApiKeySafe();
 
-  if (!apiKey || !Array.isArray(suggestions) || suggestions.length === 0) {
+  if ((!apiKey && !OPENROUTER_API_KEY) || !Array.isArray(suggestions) || suggestions.length === 0) {
     return suggestions;
   }
 
@@ -2549,6 +2579,8 @@ const server = http.createServer(async (req, res) => {
         success: true,
         message: "Backend çalışıyor.",
         services: {
+          aiProvider: OPENROUTER_API_KEY ? "openrouter" : "gemini",
+          openrouter: Boolean(OPENROUTER_API_KEY),
           gemini: Boolean(GEMINI_API_KEY),
           serper: Boolean(SERPER_API_KEY),
           tmdb: Boolean(TMDB_ACCESS_TOKEN),
