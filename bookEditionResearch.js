@@ -4,6 +4,8 @@ function validIsbn(value) {
   const isbn = String(value || '').replace(/[^\d]/g, '');
   return /^97[89]\d{10}$/.test(isbn) && [...isbn].reduce((sum, digit, i) => sum + Number(digit) * (i % 2 ? 3 : 1), 0) % 10 === 0 ? isbn : null;
 }
+// Academic and medical honorifics are not part of the person's identity.
+const authorName = value => plain(value).replace(/^(?:(?:Prof(?:esör)?|Doç(?:ent)?|Dr|Doktor|Uzm|Op|Yrd)\.?\s+)+/iu, '').trim();
 const name = value => typeof value === 'string' ? value : Array.isArray(value) ? value.map(name).join(' ') : value?.name || '';
 function parseEdition(html, url, book = {}, expectedIsbn) {
   const text = plain(html);
@@ -31,15 +33,15 @@ function parseEdition(html, url, book = {}, expectedIsbn) {
   const authorLink = [...html.matchAll(/<a\b[^>]*href=["'][^"']*\/yazar\/[^"']+["'][^>]*>([\s\S]*?)<\/a>/gi)].map(match => plain(match[1])).find(Boolean);
   const ogTitle = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i)?.[1];
   const title = plain(schema?.name || book.searchTitle || ogTitle || html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1]).split(/\s+[|–-]\s+/)[0].trim() || null;
-  const author = plain(name(schema?.author) || authorLabel || authorLink) || null;
+  const author = authorName(name(schema?.author) || authorLabel || authorLink) || null;
   return { title, author, description: plain(schema?.description) || null, isbn, publisher, pageCount: pages > 0 && pages < 10000 ? pages : null, publishYear: date.match(/(?:19|20)\d{2}/)?.[0] || null, editionSource: url };
 }
 function consensus(sources, field) {
   const groups = new Map();
   for (const source of sources) {
     if (source[field] == null) continue;
-    const key = field === 'publisher' ? normalize(source[field]).replace(/(?:yayinlari|yayinevi|yayincilik|yayin)$/, '') : normalize(source[field]);
-    if (!groups.has(key)) groups.set(key, { value: source[field], hosts: new Set() });
+    const key = field === 'publisher' ? normalize(source[field]).replace(/(?:yayinlari|yayinevi|yayincilik|yayin)$/, '') : normalize(field === 'author' ? authorName(source[field]) : source[field]);
+    if (!groups.has(key)) groups.set(key, { value: field === 'author' ? authorName(source[field]) : source[field], hosts: new Set() });
     groups.get(key).hosts.add(new URL(source.editionSource).hostname.replace(/^www\./, ''));
   }
   const ranked = [...groups.values()].sort((a,b) => b.hosts.size - a.hosts.size);

@@ -1,5 +1,5 @@
 const assert=require('node:assert/strict');
-const {createIsbnResearch,parseEdition}=require('./bookEditionResearch');
+const {createIsbnResearch,parseEdition,consensus}=require('./bookEditionResearch');
 const html=(pages,author='James Oliver Curwood')=>`<h1>Ayı</h1><p>ISBN: 9786259355948 Yazar: ${author} Yayınevi: Budala Kitap Sayfa Sayısı: ${pages} Yayın Tarihi: 2026</p>`;
 const publisherPage = '<h1>Harika Başlangıç</h1><h2>Vagus Sinirinin Şifa Gücünü Keşfetmek</h2><p>Yayınevi arayabilirsiniz. Yazar: Stanley Rosenberg Yayınevi: Pegasus Yayınları Tür: Sağlık Yayın Tarihi : Ekim 2020 ISBN : 9786052999264 Sayfa : 328</p>';
 const regression = parseEdition(publisherPage, 'https://pegasusyayinlari.com/book', {searchTitle:'Vagus Sinirinin Şifa Gücünü Keşfetmek - Pegasus Yayınları'}, '9786052999264');
@@ -7,6 +7,13 @@ assert.equal(regression.title, 'Vagus Sinirinin Şifa Gücünü Keşfetmek');
 assert.equal(regression.publisher, 'Pegasus Yayınları');
 assert.equal(regression.publishYear, '2020');
 assert.equal(regression.pageCount, 328);
+const authorSources = [
+ {author:'Doç. Dr. Tuğba Atmaca Temrel', editionSource:'https://one.test/book'},
+ {author:'Tuğba Atmaca Temrel', editionSource:'https://two.test/book'},
+];
+assert.equal(consensus(authorSources, 'author'), 'Tuğba Atmaca Temrel');
+assert.equal(consensus([{...authorSources[0],author:'Prof. Dr. Başka Yazar'},authorSources[1]], 'author'), null);
+assert.equal(parseEdition(publisherPage.replace('Stanley Rosenberg','Doç. Dr. Tuğba Atmaca Temrel'),'https://one.test/book',{},'9786052999264').author,'Tuğba Atmaca Temrel');
 async function check(secondPages) {
  const research=createIsbnResearch({search:async()=>({organic:[{link:'https://one.test/book'},{link:'https://two.test/book'}]}),fetchPage:async url=>({ok:true,text:async()=>html(url.includes('one.test')?192:secondPages)})});
  return research('9786259355948');
