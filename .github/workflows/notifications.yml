@@ -1,0 +1,27 @@
+name: Check TV episodes and send notifications
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: notification-check
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Run authenticated notification check
+        env:
+          CRON_SECRET: ${{ secrets.NOTIFICATION_CRON_SECRET }}
+          BACKEND_URL: https://kutuphane-backend.onrender.com
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo 'Notifications are not configured yet. Follow NOTIFICATIONS_SETUP.md.'
+            exit 0
+          fi
+          curl --fail-with-body --silent --show-error --retry 2 --retry-all-errors --max-time 240 \
+            --request POST --header "Authorization: Bearer $CRON_SECRET" \
+            "$BACKEND_URL/api/notifications/run"

@@ -58,7 +58,7 @@ if (!TMDB_ACCESS_TOKEN) {
 
 console.log("AI sağlayıcısı:", GROQ_API_KEY ? `Groq (${GROQ_MODEL})` : OPENROUTER_API_KEY ? `OpenRouter (${OPENROUTER_MODEL})` : "Gemini");
 console.log("🤖 Gemini model:", GEMINI_MODEL);
-console.log("🖼️ Serper key okundu:", SERPER_API_KEY.slice(0, 8) + "...");
+console.log("🖼️ Serper:", SERPER_API_KEY ? "okundu" : "eksik");
 console.log("🎬 TMDb token:", TMDB_ACCESS_TOKEN ? "okundu" : "eksik");
 
 // ----------------------------------------------------------------
@@ -68,7 +68,7 @@ console.log("🎬 TMDb token:", TMDB_ACCESS_TOKEN ? "okundu" : "eksik");
 function setCorsHeaders(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 }
 
 function json(res, status, data) {
@@ -587,6 +587,7 @@ async function tmdbRequest(endpoint, params = {}) {
 
   const response = await fetch(url.toString(), {
     method: "GET",
+    signal: AbortSignal.timeout(20000),
     headers: {
       accept: "application/json",
       Authorization: `Bearer ${TMDB_ACCESS_TOKEN}`,
@@ -2419,6 +2420,7 @@ Yalnızca şu JSON'u döndür:
   return { text, books: suggestedBooks };
 }
 
+const notifications = require("./notifications").createNotificationService({ tmdbRequest, readBody, json });
 const server = http.createServer(async (req, res) => {
   setCorsHeaders(res);
 
@@ -2433,6 +2435,7 @@ const server = http.createServer(async (req, res) => {
   const pathname = url.pathname;
 
   try {
+    if (await notifications.handle(req, res, pathname)) return;
     if (req.method === "POST" && pathname === "/api/ai/recommend") {
       try {
         const payload = await readBody(req);
