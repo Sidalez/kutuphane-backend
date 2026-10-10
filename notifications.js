@@ -19,8 +19,8 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
   const admin = dependencies.admin || firebaseAdmin;
   const webpush = dependencies.webpush || webPush;
   let db, auth;
-  const publicKey = process.env.VAPID_PUBLIC_KEY || "";
-  const privateKey = process.env.VAPID_PRIVATE_KEY || "";
+  const publicKey = (process.env.VAPID_PUBLIC_KEY || "").trim();
+  const privateKey = (process.env.VAPID_PRIVATE_KEY || "").trim();
   let pushReady = false;
   try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_APPLICATION_CREDENTIALS) {
@@ -29,11 +29,21 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
       const app = admin.initializeApp({ credential, projectId: process.env.FIREBASE_PROJECT_ID || "kisiseltakipapp" }, "notifications");
       db = app.firestore(); auth = app.auth();
     }
-    if (publicKey && privateKey) {
-      webpush.setVapidDetails(process.env.VAPID_SUBJECT || "https://kisiseltakip.vercel.app", publicKey, privateKey);
+  } catch { console.error("Bildirim kurulumu: Firebase hizmet hesabı başlatılamadı. FIREBASE_SERVICE_ACCOUNT_JSON ve FIREBASE_PROJECT_ID alanlarını kontrol et."); }
+  try {
+    const missing = [!publicKey && "VAPID_PUBLIC_KEY", !privateKey && "VAPID_PRIVATE_KEY"].filter(Boolean);
+    if (missing.length) {
+      console.error(`Bildirim kurulumu: eksik alan: ${missing.join(", ")}.`);
+    } else {
+      webpush.setVapidDetails((process.env.VAPID_SUBJECT || "https://kisiseltakip.vercel.app").trim(), publicKey, privateKey);
       pushReady = true;
     }
-  } catch { console.error("Bildirim ortam ayarları geçersiz. NOTIFICATIONS_SETUP.md dosyasını kontrol et."); }
+  } catch {
+    const validKey = (value, bytes) => /^[A-Za-z0-9_-]+={0,2}$/.test(value) && Buffer.from(value, "base64url").length === bytes;
+    if (!validKey(publicKey, 65)) console.error("Bildirim kurulumu: VAPID_PUBLIC_KEY biçimi geçersiz; yalnızca anahtar değerini kopyala.");
+    else if (!validKey(privateKey, 32)) console.error("Bildirim kurulumu: VAPID_PRIVATE_KEY biçimi geçersiz; yalnızca anahtar değerini kopyala.");
+    else console.error("Bildirim kurulumu: VAPID_SUBJECT veya VAPID anahtarları geçersiz. SUBJECT için https://kisiseltakip.vercel.app kullan.");
+  }
   const ready = Boolean(db && auth);
   const accounts = () => db.collection("_notificationAccounts");
   const inbox = uid => accounts().doc(uid).collection("inbox");
