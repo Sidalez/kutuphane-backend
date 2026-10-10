@@ -162,18 +162,51 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
   }
   async function sendDevices(uid, devices, payload) {
     let failed = false;
+    const counts = { accepted: 0, alreadySent: 0, expired: 0, failed: 0 };
     for (const device of devices.docs) {
       const delivery = accounts().doc(uid).collection("receipts").doc(hash(`${payload.id}:${device.id}`));
-      if ((await delivery.get()).exists) continue;
+      if ((await delivery.get()).exists) { counts.alreadySent++; continue; }
       try {
         await webpush.sendNotification(device.data().subscription, JSON.stringify({ title: payload.title, body: payload.body, url: payload.url, tag: payload.id }), { TTL: 86400, timeout: 10000 });
         await delivery.set({ createdAt: Date.now() });
+        counts.accepted++;
       } catch (error) {
-        if (error.statusCode === 404 || error.statusCode === 410) await device.ref.delete();
-        else failed = true;
+        if (error.statusCode === 404 || error.statusCode === 410) { await device.ref.delete(); counts.expired++; }
+        else { failed = true; counts.failed++; }
       }
     }
-    if (failed) throw fail(502, "Bildirim gönderilemedi. Biraz sonra yeniden denenecek.");
+    if (failed) throw Object.assign(fail(502, "Bildirim gönderilemedi. Biraz sonra yeniden denenecek."), { counts });
+    return counts;
+  }
+  async function broadcastTest(campaignId) {
+    const job = db.collection("_notificationJobs").doc(`broadcast_${campaignId}`);
+    const previous = (await job.get()).data();
+    if (previous?.done) return { ...previous.result, alreadyCompleted: true };
+    if (!await claim(job, 30 * 60000)) throw fail(409, "Bu deneme gönderimi zaten çalışıyor.");
+    const result = { users: 0, accepted: 0, alreadySent: 0, expired: 0, failed: 0 };
+    try {
+      let cursor;
+      do {
+        let query = accounts().where("preferences.enabled", "==", true).orderBy(admin.firestore.FieldPath.documentId()).limit(100);
+        if (cursor) query = query.startAfter(cursor);
+        const page = await query.get();
+        for (const doc of page.docs) {
+          // Recheck opt-out immediately before sending. An explicit test bypasses quiet hours.
+          if (!(await account(doc.id)).preferences.enabled) continue;
+          const devices = await subscriptions(doc.id).get();
+          if (devices.empty) continue;
+          result.users++;
+          let counts;
+          try {
+            counts = await sendDevices(doc.id, devices, { id: `broadcast_${campaignId}`, title: "Kütüphanem · Deneme bildirimi", body: "Bu bir deneme bildirimidir. Yeni bölüm ve hatırlatma bildirimlerin için bağlantın hazır.", url: "/notifications" });
+          } catch (error) { if (!error.counts) throw error; counts = error.counts; }
+          for (const key of ["accepted", "alreadySent", "expired", "failed"]) result[key] += counts[key];
+        }
+        cursor = page.size === 100 ? page.docs.at(-1) : null;
+      } while (cursor);
+      await job.set({ done: result.failed === 0, result, finishedAt: Date.now() }, { merge: true });
+      return result;
+    } finally { await job.set({ leaseUntil: 0 }, { merge: true }); }
   }
   async function checkUser(uid) {
     const ref = accounts().doc(uid);
@@ -216,11 +249,17 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
       if (req.method === "GET" && pathname === "/api/notifications/config") {
         json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null }); return true;
       }
-      if (req.method === "POST" && pathname === "/api/notifications/run") {
+      if (req.method === "POST" && ["/api/notifications/run", "/api/notifications/broadcast-test"].includes(pathname)) {
         const expected = process.env.NOTIFICATION_CRON_SECRET || "";
         const supplied = (req.headers.authorization || "").replace(/^Bearer /, "");
       if (expected.length < 32 || Buffer.byteLength(supplied) !== Buffer.byteLength(expected) || !timingSafeEqual(Buffer.from(expected), Buffer.from(supplied))) throw fail(401, "Yetkisiz zamanlayıcı isteği.");
         if (!ready) throw fail(503, "Bildirim sunucusu henüz etkinleştirilmedi.");
+        if (pathname === "/api/notifications/broadcast-test") {
+          if (!pushReady) throw fail(503, "Telefon bildirimleri henüz etkin değil.");
+          const body = await readBody(req);
+          if (!/^[a-zA-Z0-9_-]{8,80}$/.test(body?.campaignId || "")) throw fail(400, "Geçerli bir gönderim kimliği gerekli.");
+          json(res, 200, await broadcastTest(body.campaignId)); return true;
+        }
         json(res, 200, await run()); return true;
       }
       const uid = await userId(req);

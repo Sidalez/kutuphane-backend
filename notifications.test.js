@@ -135,5 +135,24 @@ test("authenticated flow: baseline, deduplication, retries, account isolation, q
     await request("alice", "/check", {}); assert.equal(sends.length, before + 1);
     await request("alice", "/preferences", { enabled: false });
     await request("alice", "/check", {}); assert.equal(sends.length, before + 1);
+    process.env.NOTIFICATION_CRON_SECRET = "broadcast-test-secret-".repeat(3);
+    assert.equal((await request("alice", "/broadcast-test", { campaignId: "test_campaign" })).status, 401);
+    assert.equal((await request(process.env.NOTIFICATION_CRON_SECRET, "/broadcast-test", { campaignId: "bad" })).status, 400);
+    await request("bob", "/preferences", { enabled: true, quietEnabled: true, quietStart: clock.time, quietEnd: after });
+    const third = subscription("https://fcm.googleapis.com/device3");
+    await request("bob", "/subscribe", { subscription: third });
+    failEndpoint = third.endpoint;
+    const broadcastBefore = sends.length;
+    const broadcast = await request(process.env.NOTIFICATION_CRON_SECRET, "/broadcast-test", { campaignId: "test_campaign" });
+    assert.equal(broadcast.status, 200);
+    assert.deepEqual(broadcast.body, { users: 1, accepted: 1, alreadySent: 0, expired: 0, failed: 1 });
+    assert.ok(sends.slice(broadcastBefore).every(s => s.endpoint !== second.endpoint), "disabled account must not receive a broadcast");
+    failEndpoint = "";
+    const retry = await request(process.env.NOTIFICATION_CRON_SECRET, "/broadcast-test", { campaignId: "test_campaign" });
+    assert.deepEqual(retry.body, { users: 1, accepted: 1, alreadySent: 1, expired: 0, failed: 0 });
+    const completed = sends.length;
+    const replay = await request(process.env.NOTIFICATION_CRON_SECRET, "/broadcast-test", { campaignId: "test_campaign" });
+    assert.equal(replay.body.alreadyCompleted, true);
+    assert.equal(sends.length, completed);
   } finally { process.env = original; }
 });
