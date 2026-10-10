@@ -3,6 +3,28 @@ const assert = require("node:assert/strict");
 const { preferences, localClock, isQuiet, validSubscription, episodeEvents } = require("./notificationLogic");
 const { createNotificationService } = require("./notifications");
 
+test("installed Firebase SDK initializes notifications with service account credentials", async () => {
+  const names = ["FIREBASE_SERVICE_ACCOUNT_JSON", "NOTIFICATION_POLLING", "VAPID_PUBLIC_KEY", "VAPID_PRIVATE_KEY"];
+  const previous = Object.fromEntries(names.map(name => [name, process.env[name]]));
+  const { privateKey } = require("node:crypto").generateKeyPairSync("rsa", { modulusLength: 2048 });
+  try {
+    process.env.FIREBASE_SERVICE_ACCOUNT_JSON = JSON.stringify({ project_id: "test-project", client_email: "test@test-project.iam.gserviceaccount.com", private_key: privateKey.export({ type: "pkcs8", format: "pem" }) });
+    process.env.NOTIFICATION_POLLING = "false";
+    delete process.env.VAPID_PUBLIC_KEY;
+    delete process.env.VAPID_PRIVATE_KEY;
+    const service = createNotificationService({});
+    assert.equal(service.ready, true);
+  } finally {
+    const { getApps, deleteApp } = require("firebase-admin/app");
+    const app = getApps().find(app => app.name === "notifications");
+    if (app) await deleteApp(app);
+    for (const name of names) {
+      if (previous[name] === undefined) delete process.env[name];
+      else process.env[name] = previous[name];
+    }
+  }
+});
+
 test("preferences validate times, booleans and timezones", () => {
   const p = preferences({ enabled: "yes", quietStart: "99:00", timeZone: "invalid", delivery: "spam", reading: true });
   assert.equal(p.enabled, false); assert.equal(p.quietStart, "22:00"); assert.equal(p.timeZone, "Europe/Istanbul"); assert.equal(p.delivery, "instant"); assert.equal(p.reading, true);

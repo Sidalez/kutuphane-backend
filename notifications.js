@@ -1,5 +1,15 @@
 const { createHash, timingSafeEqual } = require("node:crypto");
-const firebaseAdmin = require("firebase-admin");
+const firebaseApp = require("firebase-admin/app");
+const { getFirestore, FieldPath } = require("firebase-admin/firestore");
+const { getAuth } = require("firebase-admin/auth");
+const firebaseAdmin = {
+  credential: { cert: firebaseApp.cert, applicationDefault: firebaseApp.applicationDefault },
+  initializeApp: (options, name) => {
+    const app = firebaseApp.initializeApp(options, name);
+    return { firestore: () => getFirestore(app), auth: () => getAuth(app) };
+  },
+  firestore: { FieldPath },
+};
 const webPush = require("web-push");
 const { preferences, localClock, isQuiet, validSubscription, episodeEvents } = require("./notificationLogic");
 const hash = value => createHash("sha256").update(value).digest("hex");
