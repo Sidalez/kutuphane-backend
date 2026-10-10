@@ -1,5 +1,5 @@
 const normalize = value => String(value || '').toLocaleLowerCase('tr-TR').normalize('NFD').replace(/\p{M}/gu, '').replace(/ı/g, 'i').replace(/[^\p{L}\p{N}]/gu, '');
-const plain = html => String(html || '').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' ').replace(/&nbsp;|&#160;/gi, ' ').replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/&(uuml|Uuml|ouml|Ouml|ccedil|Ccedil|scedil|Scedil|gbreve|Gbreve|imath|Idot);/g, (_, entity) => ({uuml:'ü',Uuml:'Ü',ouml:'ö',Ouml:'Ö',ccedil:'ç',Ccedil:'Ç',scedil:'ş',Scedil:'Ş',gbreve:'ğ',Gbreve:'Ğ',imath:'ı',Idot:'İ'}[entity])).replace(/\s+/g, ' ').trim();
+const plain = html => String(html || '').replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, ' ').replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]*>/g, ' ').replace(/&#(\d+);/g, (_, n) => Number(n) <= 0x10ffff ? String.fromCodePoint(Number(n)) : '').replace(/&#x([0-9a-f]+);/gi, (_, n) => parseInt(n, 16) <= 0x10ffff ? String.fromCodePoint(parseInt(n, 16)) : '').replace(/&nbsp;|&#160;/gi, ' ').replace(/&amp;/gi, '&').replace(/&quot;/gi, '"').replace(/&(uuml|Uuml|ouml|Ouml|ccedil|Ccedil|scedil|Scedil|gbreve|Gbreve|imath|Idot);/g, (_, entity) => ({uuml:'ü',Uuml:'Ü',ouml:'ö',Ouml:'Ö',ccedil:'ç',Ccedil:'Ç',scedil:'ş',Scedil:'Ş',gbreve:'ğ',Gbreve:'Ğ',imath:'ı',Idot:'İ'}[entity])).replace(/\s+/g, ' ').trim();
 function cleanDescription(value) {
   if (typeof value !== 'string') return null;
   const blocks = value
@@ -21,7 +21,12 @@ function validIsbn(value) {
   return /^97[89]\d{10}$/.test(isbn) && [...isbn].reduce((sum, digit, i) => sum + Number(digit) * (i % 2 ? 3 : 1), 0) % 10 === 0 ? isbn : null;
 }
 // Academic and medical honorifics are not part of the person's identity.
-const authorName = value => plain(value).replace(/^(?:(?:Prof(?:esör)?|Doç(?:ent)?|Dr|Doktor|Uzm|Op|Yrd)\.?\s+)+/iu, '').trim();
+function authorName(value) {
+  return plain(value)
+    .replace(/^(?:(?:Prof(?:esör)?|Doç(?:ent)?|Dr|Doktor|Uzm|Op|Yrd)\.?\s+)+/iu, '')
+    .split(/\s*(?:%\s*\d+|\d+(?:[.,]\d+)?\s*%|[₺$€£]|\d[\d.,]*\s*(?:TL\b|TRY\b|₺|€|\$))|\s+(?:indirim(?:li)?|fiyat(?:ı)?|sepete|stok(?:ta)?|kargo|taksit|satın al|liste fiyatı|kazancınız|kampanya)\b/iu)[0]
+    .replace(/[\s|:;–-]+$/u, '').trim();
+}
 const name = value => typeof value === 'string' ? value : Array.isArray(value) ? value.map(name).join(', ') : value?.name || '';
 function parseEdition(html, url, book = {}, expectedIsbn) {
   const text = plain(html);
@@ -49,7 +54,7 @@ function parseEdition(html, url, book = {}, expectedIsbn) {
   const authorLink = [...html.matchAll(/<a\b[^>]*href=["'][^"']*\/yazar\/[^"']+["'][^>]*>([\s\S]*?)<\/a>/gi)].map(match => plain(match[1])).find(Boolean);
   const ogTitle = html.match(/<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["']/i)?.[1];
   let title = plain(schema?.name || book.searchTitle || ogTitle || html.match(/<h1\b[^>]*>([\s\S]*?)<\/h1>/i)?.[1]).split(/\s+[|–]\s+/)[0].trim() || null;
-  const rawAuthor = authorName(name(schema?.author) || authorLabel || authorLink);
+  const rawAuthor = authorName(name(schema?.author)) || authorName(authorLabel) || authorName(authorLink);
   const author = /^(?:Yazar Yok|Yok|Bilinmiyor|Belirtilmemiş)$/i.test(rawAuthor) ? null : rawAuthor || null;
   if (title) {
     const parts = title.split(/\s+-\s+/);
@@ -100,7 +105,7 @@ function createEditionResearch({ search, fetchPage }) {
     const selected = editions[0];
     const extra = await collect(`"${selected.isbn}" yayınevi sayfa yayın tarihi`, book, selected.isbn).catch(() => []);
     const sources = [...new Map([...editions.filter(e => e.isbn === selected.isbn), ...extra].map(e => [e.editionSource,e])).values()];
-    const value = { ...selected, publisher: consensus(sources,'publisher') || selected.publisher, pageCount: consensus(sources,'pageCount'), publishYear: selected.publishYear || consensus(sources,'publishYear'), editionSources: sources.map(e => e.editionSource) };
+    const value = { ...selected, author: consensus(sources,'author') || selected.author || null, publisher: consensus(sources,'publisher') || selected.publisher, pageCount: consensus(sources,'pageCount'), publishYear: selected.publishYear || consensus(sources,'publishYear'), editionSources: sources.map(e => e.editionSource) };
     if (cache.size >= 200) cache.delete(cache.keys().next().value);
     cache.set(key, { value, expires: Date.now() + 6 * 60 * 60 * 1000 });
     return value;

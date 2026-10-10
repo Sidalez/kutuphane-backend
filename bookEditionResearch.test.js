@@ -12,6 +12,15 @@ assert.equal(parseEdition(html, 'https://one.test/book', {}, '9789750849503'), n
 assert.equal(consensus([parsed, { ...parsed, editionSource: 'https://one.test/other' }], 'pageCount'), null);
 assert.equal(consensus([parsed, { ...parsed, editionSource: 'https://two.test/book' }], 'pageCount'), 240);
 assert.equal(consensus([parsed, { ...parsed, pageCount: 24, editionSource: 'https://two.test/book' }], 'pageCount'), null);
+// Store pricing immediately follows the author label on some product pages.
+for (const suffix of ['30% indirim ₺180,00 ₺126,00', '%30 indirim 180,00 TL', '180,00 TL Sepete Ekle', '₺180,00', 'Kargo bedava', '180,00 ₺', '&#8378;180,00']) {
+  const page = `<h1>Zaman Makinesi</h1><p>ISBN: 9786053754268 Yazar: H. G. WELLS ${suffix}</p>`;
+  assert.equal(parseEdition(page, 'https://store.test/book', {}, '9786053754268').author, 'H. G. WELLS', suffix);
+}
+const schemaPage = `<h1>Zaman Makinesi</h1><script type="application/ld+json">${JSON.stringify({isbn:'9786053754268',name:'Zaman Makinesi',author:{name:'H. G. Wells 30% indirim ₺180,00'}})}</script>`;
+assert.equal(parseEdition(schemaPage, 'https://store.test/book', {}, '9786053754268').author, 'H. G. Wells');
+const linkedPage = '<h1>Zaman Makinesi</h1><p>ISBN: 9786053754268 Yazar: ₺180,00</p><a href="/yazar/h-g-wells">H. G. Wells</a>';
+assert.equal(parseEdition(linkedPage, 'https://store.test/book', {}, '9786053754268').author, 'H. G. Wells');
 (async () => {
   let searches = 0;
   const research = createEditionResearch({
