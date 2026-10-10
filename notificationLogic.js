@@ -44,8 +44,8 @@ function episodeEvents(item, episodes, since, today) {
     if (!Number.isInteger(season) || season < 1 || !Number.isInteger(number) || number < 1 || !/^\d{4}-\d{2}-\d{2}$/.test(airDate || "")) continue;
     if (airDate < since || airDate > today || seen.has(`${season}:${number}`)) continue;
     const id = `episode_${item.tmdbId}_${season}_${number}`;
-    unique.set(id, { id, kind: "episode", title: `${item.title}: yeni bölüm`,
-      body: `${season}. sezon ${number}. bölüm yayımlandı${episode.name ? `: ${String(episode.name).slice(0, 120)}` : "."}`,
+    unique.set(id, { id, kind: "episode", title: `${item.title} · Yeni bölüm`,
+      body: `${season}. sezon, ${number}. bölüm yayında${episode.name ? `: ${String(episode.name).slice(0, 120)}` : "."}`,
       url: `/media/${encodeURIComponent(item.id)}`, airDate });
   }
   return [...unique.values()];

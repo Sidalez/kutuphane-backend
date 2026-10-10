@@ -147,7 +147,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
       const digestRef = accounts().doc(uid).collection("deliveries").doc(`digest_${clock.date}`);
       if ((await digestRef.get()).data()?.done) return;
       if (!await claim(digestRef, 2 * 60000)) return;
-      const payload = { id: `digest_${clock.date}`, title: "Kütüphanem’de bugün", body: `${allowed.length} yeni bildirimin var. ${allowed[0].data().title}`, url: "/notifications" };
+      const payload = { id: `digest_${clock.date}`, title: "Günlük özetin hazır", body: `${allowed.length} yeni gelişme seni bekliyor. ${allowed[0].data().title}`, url: "/notifications" };
       await sendDevices(uid, devices, payload);
       await digestRef.set({ done: true, leaseUntil: 0 });
       for (const d of allowed) await d.ref.update({ pushState: "sent" });
@@ -289,7 +289,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
         const devices = await subscriptions(uid).get();
         if (devices.empty) throw fail(400, "Önce bu cihazda telefon bildirimlerini aç.");
         await accounts().doc(uid).set({ testAt: Date.now() }, { merge: true });
-        await sendDevices(uid, devices, { id: `test_${Date.now()}`, title: "Kütüphanem yanında", body: "Telefon bildirimlerin hazır. Yeni bölümleri buradan haber vereceğiz.", url: "/notifications" });
+        await sendDevices(uid, devices, { id: `test_${Date.now()}`, title: "Bildirimler etkinleştirildi", body: "Takip ettiğin dizilerin yeni bölümlerini ve seçtiğin hatırlatmaları burada göreceksin.", url: "/notifications" });
         json(res, 200, { success: true }); return true;
       }
       json(res, 404, { message: "Bildirim işlemi bulunamadı." }); return true;
