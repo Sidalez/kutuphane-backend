@@ -154,5 +154,17 @@ test("authenticated flow: baseline, deduplication, retries, account isolation, q
     const replay = await request(process.env.NOTIFICATION_CRON_SECRET, "/broadcast-test", { campaignId: "test_campaign" });
     assert.equal(replay.body.alreadyCompleted, true);
     assert.equal(sends.length, completed);
+    await db.collection("books").doc("alice_book").set({ userId: "alice", title: "Başkasının kitabı", status: "OKUNUYOR", updatedAt: { seconds: 30 } });
+    await db.collection("books").doc("bob_old").set({ userId: "bob", title: "Önceki kitap", status: "OKUNUYOR", updatedAt: { seconds: 10 } });
+    await db.collection("books").doc("bob_current").set({ userId: "bob", title: "Şimdiki kitap", status: "OKUNUYOR", pagesRead: 42, totalPages: 200, updatedAt: { seconds: 20 } });
+    await db.collection("books").doc("bob_done").set({ userId: "bob", title: "Bitmiş kitap", status: "OKUNDU", updatedAt: { seconds: 40 } });
+    const reading = await request(process.env.NOTIFICATION_CRON_SECRET, "/broadcast-test", { campaignId: "reading_campaign", kind: "reading" });
+    assert.equal(reading.body.accepted, 2);
+    assert.ok(sends.slice(completed).every(s => s.payload.body.includes("Şimdiki kitap") && s.payload.body.includes("42. sayfada") && s.payload.url === "/library/bob_current"));
+    await db.collection("books").doc("bob_current").update({ status: "OKUNDU" });
+    await db.collection("books").doc("bob_old").update({ status: "OKUNDU" });
+    const noBook = await request(process.env.NOTIFICATION_CRON_SECRET, "/broadcast-test", { campaignId: "reading_no_book", kind: "reading" });
+    assert.equal(noBook.body.noReadingBook, 1);
+    assert.equal(noBook.body.accepted, 0);
   } finally { process.env = original; }
 });

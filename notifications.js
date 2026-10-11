@@ -178,12 +178,14 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     if (failed) throw Object.assign(fail(502, "Bildirim gönderilemedi. Biraz sonra yeniden denenecek."), { counts });
     return counts;
   }
-  async function broadcastTest(campaignId) {
-    const job = db.collection("_notificationJobs").doc(`broadcast_${campaignId}`);
+  async function broadcastTest(campaignId, kind = "test") {
+    const deliveryId = `${kind === "reading" ? "reading_broadcast" : "broadcast"}_${campaignId}`;
+    const job = db.collection("_notificationJobs").doc(deliveryId);
     const previous = (await job.get()).data();
     if (previous?.done) return { ...previous.result, alreadyCompleted: true };
     if (!await claim(job, 30 * 60000)) throw fail(409, "Bu deneme gönderimi zaten çalışıyor.");
     const result = { users: 0, accepted: 0, alreadySent: 0, expired: 0, failed: 0 };
+    if (kind === "reading") result.noReadingBook = 0;
     try {
       let cursor;
       do {
@@ -195,10 +197,22 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
           if (!(await account(doc.id)).preferences.enabled) continue;
           const devices = await subscriptions(doc.id).get();
           if (devices.empty) continue;
+          let payload = { id: deliveryId, title: "Kütüphanem · Deneme bildirimi", body: "Bu bir deneme bildirimidir. Yeni bölüm ve hatırlatma bildirimlerin için bağlantın hazır.", url: "/notifications" };
+          if (kind === "reading") {
+            const books = await db.collection("books").where("userId", "==", doc.id).get();
+            const updated = book => { const value = book.data().updatedAt; return typeof value?.toMillis === "function" ? value.toMillis() : Number(value?.seconds || 0) * 1000; };
+            const book = books.docs.filter(book => book.data().status === "OKUNUYOR" && typeof book.data().title === "string" && book.data().title.trim())
+              .sort((a, b) => updated(b) - updated(a) || a.id.localeCompare(b.id))[0];
+            if (!book) { result.noReadingBook++; continue; }
+            const title = book.data().title.trim().replace(/\s+/g, " ").slice(0, 120);
+            const page = Number(book.data().pagesRead), total = Number(book.data().totalPages);
+            const progress = Number.isSafeInteger(page) && page > 0 && (!Number.isFinite(total) || total <= 0 || page < total) ? `${page}. sayfada kalmıştın. ` : "";
+            payload = { id: deliveryId, title: "Okuma molana ne dersin?", body: `“${title}” seni bekliyor. ${progress}Bugün birkaç sayfa daha okuyarak kaldığın yerden devam edebilirsin.`, url: `/library/${encodeURIComponent(book.id)}` };
+          }
           result.users++;
           let counts;
           try {
-            counts = await sendDevices(doc.id, devices, { id: `broadcast_${campaignId}`, title: "Kütüphanem · Deneme bildirimi", body: "Bu bir deneme bildirimidir. Yeni bölüm ve hatırlatma bildirimlerin için bağlantın hazır.", url: "/notifications" });
+            counts = await sendDevices(doc.id, devices, payload);
           } catch (error) { if (!error.counts) throw error; counts = error.counts; }
           for (const key of ["accepted", "alreadySent", "expired", "failed"]) result[key] += counts[key];
         }
@@ -247,7 +261,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     if (!pathname.startsWith("/api/notifications")) return false;
     try {
       if (req.method === "GET" && pathname === "/api/notifications/config") {
-        json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null }); return true;
+        json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null, personalizedReading: true }); return true;
       }
       if (req.method === "POST" && ["/api/notifications/run", "/api/notifications/broadcast-test"].includes(pathname)) {
         const expected = process.env.NOTIFICATION_CRON_SECRET || "";
@@ -258,7 +272,8 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
           if (!pushReady) throw fail(503, "Telefon bildirimleri henüz etkin değil.");
           const body = await readBody(req);
           if (!/^[a-zA-Z0-9_-]{8,80}$/.test(body?.campaignId || "")) throw fail(400, "Geçerli bir gönderim kimliği gerekli.");
-          json(res, 200, await broadcastTest(body.campaignId)); return true;
+          if (body.kind !== undefined && !["test", "reading"].includes(body.kind)) throw fail(400, "Geçersiz bildirim türü.");
+          json(res, 200, await broadcastTest(body.campaignId, body.kind)); return true;
         }
         json(res, 200, await run()); return true;
       }
