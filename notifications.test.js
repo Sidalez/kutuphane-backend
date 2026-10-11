@@ -146,14 +146,22 @@ test("authenticated flow: baseline, deduplication, retries, account isolation, q
     const broadcast = await request(process.env.NOTIFICATION_CRON_SECRET, "/broadcast-test", { campaignId: "test_campaign" });
     assert.equal(broadcast.status, 200);
     assert.deepEqual(broadcast.body, { users: 1, accepted: 1, alreadySent: 0, expired: 0, failed: 1 });
+    const recordedBroadcast = (await request("bob", "")).body.items.find(item => item.id === "broadcast_test_campaign");
+    assert.equal(recordedBroadcast.kind, "test");
+    assert.equal(recordedBroadcast.read, false, "failed/partial pushes must still appear unread in inbox");
+    assert.equal(db.store.get("_notificationAccounts/bob/inbox/broadcast_test_campaign").pushState, "failed");
     assert.ok(sends.slice(broadcastBefore).every(s => s.endpoint !== second.endpoint), "disabled account must not receive a broadcast");
     failEndpoint = "";
     const retry = await request(process.env.NOTIFICATION_CRON_SECRET, "/broadcast-test", { campaignId: "test_campaign" });
     assert.deepEqual(retry.body, { users: 1, accepted: 1, alreadySent: 1, expired: 0, failed: 0 });
+    await request("bob", "/read", { id: "broadcast_test_campaign" });
     const completed = sends.length;
     const replay = await request(process.env.NOTIFICATION_CRON_SECRET, "/broadcast-test", { campaignId: "test_campaign" });
     assert.equal(replay.body.alreadyCompleted, true);
     assert.equal(sends.length, completed);
+    const afterReplay = (await request("bob", "")).body.items.filter(item => item.id === "broadcast_test_campaign");
+    assert.equal(afterReplay.length, 1);
+    assert.equal(afterReplay[0].read, true, "retries preserve read state");
     await db.collection("books").doc("alice_book").set({ userId: "alice", title: "Başkasının kitabı", status: "OKUNUYOR", updatedAt: { seconds: 30 } });
     await db.collection("books").doc("bob_old").set({ userId: "bob", title: "Önceki kitap", status: "OKUNUYOR", updatedAt: { seconds: 10 } });
     await db.collection("books").doc("bob_current").set({ userId: "bob", title: "Şimdiki kitap", status: "OKUNUYOR", pagesRead: 42, totalPages: 200, updatedAt: { seconds: 20 } });
@@ -193,5 +201,10 @@ test("authenticated flow: baseline, deduplication, retries, account isolation, q
     await request("bob", "/preferences", { quietEnabled: false });
     await request("bob", "/check", {});
     assert.equal(sends.length, readingBefore + 2, "a new session cancels a queued follow-up");
+    const directTest = await request("bob", "/test", {});
+    assert.equal(directTest.status, 200);
+    const recordedTest = (await request("bob", "")).body.items.find(item => item.id.startsWith("test_"));
+    assert.equal(recordedTest.kind, "test");
+    assert.equal(recordedTest.read, false);
   } finally { process.env = original; }
 });

@@ -68,8 +68,8 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     const snap = await accounts().doc(uid).get();
     return { ...snap.data(), preferences: preferences(snap.data()?.preferences) };
   }
-  async function createEvent(uid, event) {
-    try { await inbox(uid).doc(event.id).create({ ...event, createdAt: Date.now(), read: false, pushState: "pending" }); }
+  async function createEvent(uid, event, pushState = "pending") {
+    try { await inbox(uid).doc(event.id).create({ ...event, createdAt: Date.now(), read: false, pushState }); }
     catch (error) { if (error.code !== 6 && error.code !== "already-exists") throw error; }
   }
   async function claim(ref, duration) {
@@ -209,6 +209,17 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     if (failed) throw Object.assign(fail(502, "Bildirim gönderilemedi. Biraz sonra yeniden denenecek."), { counts });
     return counts;
   }
+  async function sendRecorded(uid, devices, payload, kind) {
+    // Persist before push, including failures; direct sends never enter the scheduled queue.
+    await createEvent(uid, { ...payload, kind }, "sending");
+    const ref = inbox(uid).doc(payload.id);
+    const saved = (await ref.get()).data();
+    try {
+      const counts = await sendDevices(uid, devices, { ...saved, id: payload.id });
+      await ref.update({ pushState: "sent" });
+      return counts;
+    } catch (error) { await ref.update({ pushState: "failed" }); throw error; }
+  }
   async function broadcastTest(campaignId, kind = "test") {
     const deliveryId = `${kind === "readingActivity" ? "activity_broadcast" : kind === "reading" ? "reading_broadcast" : "broadcast"}_${campaignId}`;
     const job = db.collection("_notificationJobs").doc(deliveryId);
@@ -260,7 +271,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
           result.users++;
           let counts;
           try {
-            counts = await sendDevices(doc.id, devices, payload);
+            counts = await sendRecorded(doc.id, devices, payload, kind === "test" ? "test" : "reading");
           } catch (error) { if (!error.counts) throw error; counts = error.counts; }
           for (const key of ["accepted", "alreadySent", "expired", "failed"]) result[key] += counts[key];
         }
@@ -395,7 +406,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
         const devices = await subscriptions(uid).get();
         if (devices.empty) throw fail(400, "Önce bu cihazda telefon bildirimlerini aç.");
         await accounts().doc(uid).set({ testAt: Date.now() }, { merge: true });
-        await sendDevices(uid, devices, { id: `test_${Date.now()}`, title: "Bildirimler etkinleştirildi", body: "Takip ettiğin dizilerin yeni bölümlerini ve seçtiğin hatırlatmaları burada göreceksin.", url: "/notifications" });
+        await sendRecorded(uid, devices, { id: `test_${Date.now()}`, title: "Bildirimler etkinleştirildi", body: "Takip ettiğin dizilerin yeni bölümlerini ve seçtiğin hatırlatmaları burada göreceksin.", url: "/notifications" }, "test");
         json(res, 200, { success: true }); return true;
       }
       json(res, 404, { message: "Bildirim işlemi bulunamadı." }); return true;
