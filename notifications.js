@@ -159,13 +159,14 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     if (event) await createEvent(uid, { ...event, id: `reading_followup_${hash(`${latest.book.id}:${latest.session.id}`)}` });
   }
   async function deliver(uid, p, now) {
-    p = (await account(uid)).preferences;
+    const current = await account(uid);
+    p = current.preferences;
     if (!p.enabled) return;
     if (!pushReady || isQuiet(localClock(now, p.timeZone).time, p)) return;
     const clock = localClock(now, p.timeZone);
     if (p.delivery === "daily" && clock.time < p.digestTime) return;
     const pending = await inbox(uid).where("pushState", "==", "pending").limit(100).get();
-    let allowed = pending.docs.filter(d => !d.data().read && (d.data().kind === "test" || p[{ episode: "episodes", season: "seasons", reading: "reading", readingFollowUp: "readingFollowUp", watching: "watching" }[d.data().kind]]) && now.getTime() - d.data().createdAt < 7 * 86400000);
+    let allowed = pending.docs.filter(d => !d.data().read && !d.data().deleted && d.data().createdAt > (current.inboxClearedAt || 0) && (d.data().kind === "test" || p[{ episode: "episodes", season: "seasons", reading: "reading", readingFollowUp: "readingFollowUp", watching: "watching" }[d.data().kind]]) && now.getTime() - d.data().createdAt < 7 * 86400000);
     if (allowed.some(d => d.data().kind === "readingFollowUp")) {
       const latest = await latestReadingSession(uid);
       allowed = allowed.filter(d => d.data().kind !== "readingFollowUp" || (latest && latest.book.id === d.data().bookId && latest.session.id === d.data().logId && now.getTime() < d.data().expiresAt));
@@ -345,9 +346,20 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
         const a = await account(uid);
         const list = await inbox(uid).orderBy("createdAt", "desc").limit(100).get();
         const devices = await subscriptions(uid).get();
-        json(res, 200, { preferences: a.preferences, checkedAt: a.checkedAt || null, deviceCount: devices.size, items: list.docs.map(d => ({ id: d.id, ...d.data() })) }); return true;
+        json(res, 200, { preferences: a.preferences, checkedAt: a.checkedAt || null, deviceCount: devices.size, items: list.docs.filter(d => !d.data().deleted && d.data().createdAt > (a.inboxClearedAt || 0)).map(d => ({ id: d.id, ...d.data() })) }); return true;
       }
       const body = req.method === "POST" ? await readBody(req) : {};
+      if (req.method === "POST" && pathname === "/api/notifications/clear") {
+        if (body.all === true) {
+          const clearedAt = Date.now();
+          await accounts().doc(uid).set({ inboxClearedAt: clearedAt }, { merge: true });
+          json(res, 200, { success: true, clearedAt }); return true;
+        }
+        if (typeof body.id !== "string" || !/^[\w-]{1,150}$/.test(body.id)) throw fail(400, "Geçersiz bildirim.");
+        const ref = inbox(uid).doc(body.id);
+        if ((await ref.get()).exists) await ref.update({ deleted: true, read: true, pushState: "skipped" });
+        json(res, 200, { success: true }); return true;
+      }
       if (req.method === "POST" && pathname === "/api/notifications/preferences") {
         const current = await account(uid);
         const next = preferences({ ...current.preferences, ...body });

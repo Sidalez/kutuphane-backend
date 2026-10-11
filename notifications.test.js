@@ -206,5 +206,23 @@ test("authenticated flow: baseline, deduplication, retries, account isolation, q
     const recordedTest = (await request("bob", "")).body.items.find(item => item.id.startsWith("test_"));
     assert.equal(recordedTest.kind, "test");
     assert.equal(recordedTest.read, false);
+    assert.equal((await request("invalid", "/clear", { all: true })).status, 401);
+    assert.equal((await request("bob", "/clear", { id: "../alice" })).status, 400);
+    const aliceCount = (await request("alice", "")).body.items.length;
+    await request("bob", "/clear", { id: items[0].id });
+    assert.equal((await request("alice", "")).body.items.length, aliceCount, "cannot clear another user's inbox");
+    await request("bob", "/clear", { id: recordedTest.id });
+    assert.ok(!(await request("bob", "")).body.items.some(item => item.id === recordedTest.id));
+    assert.equal(db.store.get(`_notificationAccounts/bob/inbox/${recordedTest.id}`).deleted, true, "keep a tombstone to prevent reappearance");
+    for (let i = 0; i < 105; i++) await db.collection("_notificationAccounts").doc("bob").collection("inbox").doc(`old_${i}`).set({ createdAt: Date.now() - 10000, read: false, kind: "episode", pushState: "pending" });
+    const cleared = await request("bob", "/clear", { all: true });
+    assert.equal(cleared.status, 200);
+    assert.equal((await request("bob", "")).body.items.length, 0, "clear all must cover more than the 100-item display limit");
+    const beforeClearedCheck = sends.length;
+    await request("bob", "/check", {});
+    assert.equal(sends.length, beforeClearedCheck, "cleared pending notifications must not be pushed");
+    await db.collection("_notificationAccounts").doc("bob").collection("inbox").doc("after_clear").set({ createdAt: cleared.body.clearedAt + 1000, read: false, kind: "test", title: "Yeni", pushState: "sent" });
+    assert.deepEqual((await request("bob", "")).body.items.map(item => item.id), ["after_clear"], "new notifications remain visible");
+    assert.equal((await request("alice", "")).body.items.length, aliceCount);
   } finally { process.env = original; }
 });
