@@ -38,7 +38,11 @@ Firestore’da eşleşen herhangi bir `allow true` erişimi açar. Genel `match 
 
 Render ücretsiz servisi uyuyabileceği için yalnızca sunucudaki zamanlayıcıya güvenme. Backend GitHub deposunda **Settings → Secrets and variables → Actions → New repository secret** kısmına `.notifications.env` dosyasındaki `NOTIFICATION_CRON_SECRET` değerini aynı adla ekle. `.github/workflows/notifications.yml` iş akışını etkinleştir; **Actions → Check TV episodes and send notifications → Run workflow** ile ilk kontrolü çalıştır.
 
-İş akışı saatte iki kez backend’i uyandırıp kimliği doğrulanmış kontrol yapar. GitHub zamanlayıcısı gecikebilir; kesin dakikada teslim garantisi yoktur. GitHub Actions kota/etkinlik kuralları geçerlidir. Kontroller çalışırken backend ayrıca 15 dakikada bir kontrol eder. Sürekli açık başka bir zamanlayıcı kullanırsan aynı korumalı endpointi çağırıp `NOTIFICATION_POLLING=false` ayarlayabilirsin.
+İş akışı beş dakikada bir backend’i uyandırıp kimliği doğrulanmış kontrol yapar. GitHub zamanlayıcısı gecikebilir; kesin dakikada teslim garantisi yoktur. GitHub Actions kota/etkinlik kuralları geçerlidir. Sunucu açıkken ayrıca dakikada bir kontrol edilir; TMDB sorguları kullanıcı başına 30 dakikada bir yapılır. Sürekli açık başka bir zamanlayıcı kullanırsan aynı korumalı endpointi çağırıp `NOTIFICATION_POLLING=false` ayarlayabilirsin.
+
+### Okuma ritmi
+
+`readingFollowUp` tercihi varsayılan olarak açıktır; ana bildirim takibi kapalıysa gönderim yapılmaz. Okunuyor durumundaki kitapların en yeni 20 kaydı değerlendirilir ve kullanıcı için en son başlayan oturum seçilir. Başlangıç zamanı bilinen kayıttan 24 saat sonra tek hatırlatma oluşturulur. Yeni kayıt daha eski hatırlatmayı geçersiz kılar; bitirilen veya silinen kitap için gönderim yapılmaz. Kitap adı, kayıtlı süre/sayfa ilerlemesi ve güncel sayfa kullanılır; eksik süre uydurulmaz. Sessiz saatler ve günlük özet tercihleri korunur. 24 saatten fazla gecikmiş hatırlatma atlanır. Yeni kayıtlar saat dilimini içeren başlangıç anını kaydeder; eski tarih/saat alanları kullanıcının bildirim saat diliminde yorumlanır.
 
 ## 5. Telefonda açma ve doğrulama
 

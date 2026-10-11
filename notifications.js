@@ -12,6 +12,7 @@ const firebaseAdmin = {
 };
 const webPush = require("web-push");
 const { preferences, localClock, isQuiet, validSubscription, episodeEvents } = require("./notificationLogic");
+const { sessionStart, readingEvent } = require("./readingReminder");
 const hash = value => createHash("sha256").update(value).digest("hex");
 const fail = (status, message) => Object.assign(new Error(message), { status });
 
@@ -131,6 +132,31 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
       }
     }
   }
+  async function latestReadingSession(uid) {
+    const books = await db.collection("books").where("userId", "==", uid).get();
+    let latest = null;
+    const p = (await account(uid)).preferences;
+    for (const doc of books.docs) {
+      const book = { ...doc.data(), id: doc.id };
+      if (book.status !== "OKUNUYOR" || !book.title) continue;
+      const logs = await doc.ref.collection("logs").orderBy("createdAt", "desc").limit(20).get();
+      for (const logDoc of logs.docs) {
+        const log = logDoc.data();
+        if (log.userId && log.userId !== uid) continue;
+        const started = sessionStart(log, p.timeZone);
+        if (started === null || started > Date.now()) continue;
+        if (!latest || started > latest.session.started) latest = { book, session: { id: logDoc.id, log, started } };
+      }
+    }
+    return latest;
+  }
+  async function checkReading(uid, p, now) {
+    if (!p.readingFollowUp) return;
+    const latest = await latestReadingSession(uid);
+    if (!latest) return;
+    const event = readingEvent(latest.book, latest.session, now, p.timeZone);
+    if (event) await createEvent(uid, { ...event, id: `reading_followup_${hash(`${latest.book.id}:${latest.session.id}`)}` });
+  }
   async function deliver(uid, p, now) {
     p = (await account(uid)).preferences;
     if (!p.enabled) return;
@@ -138,7 +164,11 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     const clock = localClock(now, p.timeZone);
     if (p.delivery === "daily" && clock.time < p.digestTime) return;
     const pending = await inbox(uid).where("pushState", "==", "pending").limit(100).get();
-    const allowed = pending.docs.filter(d => !d.data().read && (d.data().kind === "test" || p[{ episode: "episodes", season: "seasons", reading: "reading", watching: "watching" }[d.data().kind]]) && now.getTime() - d.data().createdAt < 7 * 86400000);
+    let allowed = pending.docs.filter(d => !d.data().read && (d.data().kind === "test" || p[{ episode: "episodes", season: "seasons", reading: "reading", readingFollowUp: "readingFollowUp", watching: "watching" }[d.data().kind]]) && now.getTime() - d.data().createdAt < 7 * 86400000);
+    if (allowed.some(d => d.data().kind === "readingFollowUp")) {
+      const latest = await latestReadingSession(uid);
+      allowed = allowed.filter(d => d.data().kind !== "readingFollowUp" || (latest && latest.book.id === d.data().bookId && latest.session.id === d.data().logId && now.getTime() < d.data().expiresAt));
+    }
     for (const d of pending.docs) if (!allowed.includes(d)) await d.ref.update({ pushState: "skipped" });
     if (!allowed.length) return;
     const devices = await subscriptions(uid).get();
@@ -230,6 +260,10 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     if (!await claim(lock, 5 * 60000)) return;
     try {
       const now = new Date();
+      if (!a.readingCheckedAt || now.getTime() - a.readingCheckedAt >= 60000) {
+        await checkReading(uid, a.preferences, now);
+        await ref.set({ readingCheckedAt: now.getTime() }, { merge: true });
+      }
       if (!a.checkedAt || now.getTime() - a.checkedAt >= 30 * 60000) {
         await checkSeries(uid, a.preferences, now);
         await ref.set({ checkedAt: now.getTime() }, { merge: true });
@@ -261,7 +295,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     if (!pathname.startsWith("/api/notifications")) return false;
     try {
       if (req.method === "GET" && pathname === "/api/notifications/config") {
-        json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null, personalizedReading: true }); return true;
+        json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null, personalizedReading: true, readingFollowUp: true }); return true;
       }
       if (req.method === "POST" && ["/api/notifications/run", "/api/notifications/broadcast-test"].includes(pathname)) {
         const expected = process.env.NOTIFICATION_CRON_SECRET || "";
@@ -292,7 +326,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
         // Disabling a type discards its queued pushes; re-enabling must not replay old reminders.
         const pending = await inbox(uid).where("pushState", "==", "pending").get();
         for (const d of pending.docs) {
-          const type = { episode: "episodes", season: "seasons", reading: "reading", watching: "watching" }[d.data().kind];
+          const type = { episode: "episodes", season: "seasons", reading: "reading", readingFollowUp: "readingFollowUp", watching: "watching" }[d.data().kind];
           if (!next.enabled || (type && !next[type])) await d.ref.update({ pushState: "skipped" });
         }
         json(res, 200, { preferences: next }); return true;
@@ -353,7 +387,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     }
   }
   if (ready && process.env.NOTIFICATION_POLLING !== "false") {
-    const timer = setInterval(() => run().catch(() => console.error("Bildirim kontrolü tamamlanamadı.")), 15 * 60000);
+    const timer = setInterval(() => run().catch(() => console.error("Bildirim kontrolü tamamlanamadı.")), 60000);
     timer.unref();
   }
   return { handle, run, ready };

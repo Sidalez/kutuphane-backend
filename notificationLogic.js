@@ -1,12 +1,12 @@
 const DEFAULT_PREFERENCES = Object.freeze({
-  enabled: false, episodes: true, seasons: true, reading: false, watching: false,
+  enabled: false, episodes: true, seasons: true, reading: false, readingFollowUp: true, watching: false,
   quietEnabled: true, quietStart: "22:00", quietEnd: "09:00",
   delivery: "instant", digestTime: "20:00", reminderTime: "20:30", timeZone: "Europe/Istanbul",
 });
 const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
 function preferences(input = {}) {
   const result = { ...DEFAULT_PREFERENCES };
-  for (const key of ["enabled", "episodes", "seasons", "reading", "watching", "quietEnabled"]) {
+  for (const key of ["enabled", "episodes", "seasons", "reading", "readingFollowUp", "watching", "quietEnabled"]) {
     if (typeof input[key] === "boolean") result[key] = input[key];
   }
   for (const key of ["quietStart", "quietEnd", "digestTime", "reminderTime"]) {
