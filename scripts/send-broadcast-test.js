@@ -8,9 +8,9 @@ if (!/^[a-zA-Z0-9_-]{8,80}$/.test(campaignId || "")) {
   process.exit(1);
 }
 async function main() {
-  if (kind === "reading") {
+  if (kind === "reading" || kind === "readingActivity") {
     const config = await fetch("https://kutuphane-backend.onrender.com/api/notifications/config", { signal: AbortSignal.timeout(60000) }).then(response => response.json());
-    if (!config.personalizedReading) throw new Error("Personalized reading deployment is not ready.");
+    if (!(kind === "readingActivity" ? config.readingActivity : config.personalizedReading)) throw new Error("Personalized reading deployment is not ready.");
   }
   const contents = fs.readFileSync(path.join(__dirname, "..", ".notifications.env"), "utf8");
   const secret = process.env.NOTIFICATION_CRON_SECRET || /^NOTIFICATION_CRON_SECRET=(.+)$/m.exec(contents)?.[1]?.trim();

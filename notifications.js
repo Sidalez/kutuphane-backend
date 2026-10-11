@@ -13,6 +13,7 @@ const firebaseAdmin = {
 const webPush = require("web-push");
 const { preferences, localClock, isQuiet, validSubscription, episodeEvents } = require("./notificationLogic");
 const { sessionStart, readingEvent } = require("./readingReminder");
+const { activityPayload } = require("./readingActivity");
 const hash = value => createHash("sha256").update(value).digest("hex");
 const fail = (status, message) => Object.assign(new Error(message), { status });
 
@@ -209,7 +210,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     return counts;
   }
   async function broadcastTest(campaignId, kind = "test") {
-    const deliveryId = `${kind === "reading" ? "reading_broadcast" : "broadcast"}_${campaignId}`;
+    const deliveryId = `${kind === "readingActivity" ? "activity_broadcast" : kind === "reading" ? "reading_broadcast" : "broadcast"}_${campaignId}`;
     const job = db.collection("_notificationJobs").doc(deliveryId);
     const previous = (await job.get()).data();
     if (previous?.done) return { ...previous.result, alreadyCompleted: true };
@@ -228,6 +229,23 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
           const devices = await subscriptions(doc.id).get();
           if (devices.empty) continue;
           let payload = { id: deliveryId, title: "Kütüphanem · Deneme bildirimi", body: "Bu bir deneme bildirimidir. Yeni bölüm ve hatırlatma bildirimlerin için bağlantın hazır.", url: "/notifications" };
+          if (kind === "readingActivity") {
+            const p = (await account(doc.id)).preferences;
+            const books = await db.collection("books").where("userId", "==", doc.id).get();
+            let latest = null;
+            for (const bookDoc of books.docs) {
+              const logs = await bookDoc.ref.collection("logs").orderBy("date", "desc").limit(20).get();
+              for (const logDoc of logs.docs) {
+                const log = logDoc.data();
+                if (log.userId && log.userId !== doc.id) continue;
+                const actual = sessionStart(log, p.timeZone);
+                const started = actual ?? sessionStart({ date: log.date, startTime: "00:00" }, p.timeZone);
+                if (started === null || started > Date.now()) continue;
+                if (!latest || started > latest.started) latest = { started, hasTime: actual !== null, book: { ...bookDoc.data(), id: bookDoc.id } };
+              }
+            }
+            payload = { id: deliveryId, ...activityPayload(latest, new Date(), p.timeZone) };
+          }
           if (kind === "reading") {
             const books = await db.collection("books").where("userId", "==", doc.id).get();
             const updated = book => { const value = book.data().updatedAt; return typeof value?.toMillis === "function" ? value.toMillis() : Number(value?.seconds || 0) * 1000; };
@@ -295,7 +313,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     if (!pathname.startsWith("/api/notifications")) return false;
     try {
       if (req.method === "GET" && pathname === "/api/notifications/config") {
-        json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null, personalizedReading: true, readingFollowUp: true }); return true;
+        json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null, personalizedReading: true, readingFollowUp: true, readingActivity: true }); return true;
       }
       if (req.method === "POST" && ["/api/notifications/run", "/api/notifications/broadcast-test"].includes(pathname)) {
         const expected = process.env.NOTIFICATION_CRON_SECRET || "";
@@ -306,7 +324,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
           if (!pushReady) throw fail(503, "Telefon bildirimleri henüz etkin değil.");
           const body = await readBody(req);
           if (!/^[a-zA-Z0-9_-]{8,80}$/.test(body?.campaignId || "")) throw fail(400, "Geçerli bir gönderim kimliği gerekli.");
-          if (body.kind !== undefined && !["test", "reading"].includes(body.kind)) throw fail(400, "Geçersiz bildirim türü.");
+          if (body.kind !== undefined && !["test", "reading", "readingActivity"].includes(body.kind)) throw fail(400, "Geçersiz bildirim türü.");
           json(res, 200, await broadcastTest(body.campaignId, body.kind)); return true;
         }
         json(res, 200, await run()); return true;
