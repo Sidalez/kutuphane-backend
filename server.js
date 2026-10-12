@@ -1,3 +1,4 @@
+const { recommendationIntent, matchesSeriesIntent, excludedKeys } = require('./mediaRecommendationIntent');
 const { qualityScore, reliableCandidate, balancedSelection } = require('./mediaRecommendationQuality');
 const { createMediaTitleResolver } = require('./mediaTitles');
 // backend/server.js
@@ -1779,10 +1780,7 @@ async function getTmdbGenreList(type) {
 }
 
 function resolveGenreIds(selectedGenres, description, tmdbGenres) {
-  const rawTerms = [
-    ...asStringArray(selectedGenres),
-    ...normalizeSuggestionText(description).split(" "),
-  ].filter(Boolean);
+  const rawTerms = asStringArray(selectedGenres).filter(Boolean);
 
   const fullText = normalizeSuggestionText(
     `${asStringArray(selectedGenres).join(" ")} ${description || ""}`
@@ -2134,6 +2132,16 @@ function inferPreferredGenresFromHistory(history, type) {
   return [...new Set(values)].slice(0, 5);
 }
 
+const recommendationDetailCache = new Map();
+async function recommendationDetails(id) {
+  const cached = recommendationDetailCache.get(id);
+  if (cached && cached.expires > Date.now()) return cached.value;
+  const value = await tmdbRequest(`/tv/${id}`, {language: TMDB_LANGUAGE});
+  if (recommendationDetailCache.size >= 500) recommendationDetailCache.clear();
+  recommendationDetailCache.set(id,{value,expires:Date.now()+30*60000});
+  return value;
+}
+
 async function discoverSuggestionsByType({
   type,
   mode,
@@ -2144,6 +2152,8 @@ async function discoverSuggestionsByType({
   alreadyAddedSet,
   limit = 12,
 }) {
+  const intent = recommendationIntent(description, selectedGenres);
+  if (intent.mini && type !== "TV") return [];
   const genreList = await getTmdbGenreList(type);
 
   const inferredGenres = inferPreferredGenresFromHistory(history, type);
@@ -2153,7 +2163,7 @@ async function discoverSuggestionsByType({
     genreList
   );
 
-  const originalLanguage = inferOriginalLanguage(description, selectedGenres);
+  const originalLanguage = intent.local && !intent.localOptional ? "tr" : inferOriginalLanguage(description, selectedGenres);
 
   const providerId = provider ? await resolveProviderId(provider, type) : null;
 
@@ -2196,21 +2206,43 @@ async function discoverSuggestionsByType({
     params.with_watch_providers = providerId;
   }
 
-  const data = await tmdbRequest(endpoint, params);
-
-  const rawItems = Array.isArray(data.results) ? data.results : [];
+  if (intent.mini) params.with_type = "2";
+  const pages = await Promise.allSettled([1,2,3].map(page => tmdbRequest(endpoint,{...params,page})));
+  const pageResults = pages.filter(result=>result.status==="fulfilled").map(result=>result.value);
+  if (!pageResults.length) throw pages[0].reason;
+  if (intent.local && !originalLanguage) {
+    try {
+      const localParams = {...params,page:1,with_original_language:"tr"};
+      const local = await tmdbRequest(endpoint,localParams);
+      pageResults.unshift(local);
+    } catch {}
+  }
+  let rawItems = pageResults.flatMap(data=>Array.isArray(data.results)?data.results:[]);
+  rawItems = rawItems.filter((item,index,all)=>all.findIndex(other=>other.id===item.id)===index);
+  const verified = new Map();
+  if (type === "TV" && (intent.mini || intent.ended)) {
+    const eligible = rawItems.filter(item=>reliableCandidate(item,type) && !alreadyAddedSet.has(`${type}:${item.id}`) && !alreadyAddedSet.has(String(item.id))).slice(0,36);
+    for (let index=0;index<eligible.length;index+=6) {
+      await Promise.all(eligible.slice(index,index+6).map(async item=>{
+        try {const details=await recommendationDetails(item.id);if(matchesSeriesIntent(details,intent))verified.set(item.id,details);}catch{}
+      }));
+    }
+    rawItems=eligible.filter(item=>verified.has(item.id));
+  }
 
   const candidates = rawItems.filter(item => reliableCandidate(item, type)).map((item) =>
-    normalizeSuggestionCandidate(item, type, genreList, {
-      mode,
-      provider,
-      description,
-      genreIds,
-      originalLanguage,
-    })
+    ({...normalizeSuggestionCandidate(item, type, genreList, {
+      mode, provider, description, genreIds, originalLanguage,
+    }), originalLanguage:item.original_language,
+      ...(verified.has(item.id) ? {numberOfEpisodes:verified.get(item.id).number_of_episodes,numberOfSeasons:verified.get(item.id).number_of_seasons,isMiniseries:intent.mini} : {})})
   );
 
-  return dedupeAndFilterSuggestions(candidates, alreadyAddedSet, limit);
+  const ranked = dedupeAndFilterSuggestions(candidates, alreadyAddedSet, 100);
+  if (intent.localOptional) {
+    const locals = ranked.filter(item=>item.originalLanguage==="tr").slice(0,3);
+    return [...locals,...ranked.filter(item=>!locals.includes(item))].slice(0,limit);
+  }
+  return ranked.slice(0,limit);
 }
 
 async function getDiscoverySuggestions(payload) {
@@ -2221,9 +2253,11 @@ async function getDiscoverySuggestions(payload) {
   const selectedGenres = asStringArray(payload.genres);
   const history = payload.history || {};
   const alreadyAddedSet = getHistoryAlreadyAddedSet(history);
+  for (const key of excludedKeys(payload.excludedSuggestions)) alreadyAddedSet.add(key);
+  const intent = recommendationIntent(description, selectedGenres);
 
   const types =
-    type === "ALL"
+    intent.mini ? ["TV"] : type === "ALL"
       ? mode === "WEEKEND"
         ? ["MOVIE"]
         : ["MOVIE", "TV"]
@@ -2249,13 +2283,18 @@ async function getDiscoverySuggestions(payload) {
       provider,
       history,
       alreadyAddedSet,
-      limit: 12,
+      limit: 36,
     });
 
     allCandidates.push(...candidates);
   }
 
-  return balancedSelection(dedupeAndFilterSuggestions(allCandidates, alreadyAddedSet, 100), type === "ALL" && mode === "WEEKEND" ? "MOVIE" : type, 12);
+  const ranked = dedupeAndFilterSuggestions(allCandidates, alreadyAddedSet, 100);
+  if (intent.localOptional) {
+    const locals = ranked.filter(item=>item.originalLanguage==="tr").slice(0,3);
+    return [...locals,...balancedSelection(ranked.filter(item=>!locals.includes(item)),intent.mini?"TV":type,12-locals.length)];
+  }
+  return balancedSelection(ranked, intent.mini ? "TV" : type === "ALL" && mode === "WEEKEND" ? "MOVIE" : type, 12);
 }
 // ----------------------------------------------------------------
 // SERVER
@@ -2734,6 +2773,7 @@ const server = http.createServer(async (req, res) => {
       const type = normalizeSuggestionType(payload.type);
       const history = payload.history || {};
       const alreadyAddedSet = getHistoryAlreadyAddedSet(history);
+      for (const key of excludedKeys(payload.excludedSuggestions)) alreadyAddedSet.add(key);
 
       console.log("✨ Medya öneri isteği:", {
         mode,
@@ -2790,7 +2830,8 @@ const server = http.createServer(async (req, res) => {
         history,
       });
 
-      const selectedSuggestions = balancedSelection(aiSuggestions, mode === "WEEKEND" && type === "ALL" ? "MOVIE" : type, 12);
+      const effectiveType = recommendationIntent(payload.description, asStringArray(payload.genres)).mini ? "TV" : mode === "WEEKEND" && type === "ALL" ? "MOVIE" : type;
+      const selectedSuggestions = balancedSelection(aiSuggestions, effectiveType, 12);
       const titledSuggestions = await Promise.all(selectedSuggestions.map(async item => {
         const title = await resolveMediaTitle(item);
         return title ? { ...item, title } : null;

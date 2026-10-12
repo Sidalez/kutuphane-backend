@@ -16,7 +16,7 @@ test('Discovery sends real TMDB vote filters and explicit genres override histor
  const fs=require('node:fs'),vm=require('node:vm');const source=fs.readFileSync(require.resolve('./server'),'utf8');
  const start=source.indexOf('async function discoverSuggestionsByType('),end=source.indexOf('async function getDiscoverySuggestions(',start);
  let parameters,selected;
- const context={TMDB_LANGUAGE:'tr-TR',TMDB_REGION:'TR',getTmdbGenreList:async()=>[],inferPreferredGenresFromHistory:()=>['Korku'],resolveGenreIds:(values)=>{selected=values;return [18,35]},asStringArray:value=>value||[],inferOriginalLanguage:()=>'',tmdbRequest:async(path,params)=>{parameters=params;return {results:[]}},normalizeSuggestionCandidate:()=>{},dedupeAndFilterSuggestions:()=>[],reliableCandidate};
+ const context={recommendationIntent:require('./mediaRecommendationIntent').recommendationIntent,TMDB_LANGUAGE:'tr-TR',TMDB_REGION:'TR',getTmdbGenreList:async()=>[],inferPreferredGenresFromHistory:()=>['Korku'],resolveGenreIds:(values)=>{selected=values;return [18,35]},asStringArray:value=>value||[],inferOriginalLanguage:()=>'',tmdbRequest:async(path,params)=>{parameters=params;return {results:[]}},normalizeSuggestionCandidate:()=>{},dedupeAndFilterSuggestions:()=>[],reliableCandidate};
  vm.createContext(context);vm.runInContext(source.slice(start,end),context);
  await context.discoverSuggestionsByType({type:'MOVIE',mode:'HIGH_RATED_UNWATCHED',description:'',selectedGenres:['Komedi'],provider:'',history:{},alreadyAddedSet:new Set()});
  assert.equal(parameters['vote_count.gte'],1000);assert.equal(parameters.vote_count_gte,undefined);assert.equal(parameters['vote_average.gte'],7);assert.equal(parameters.with_genres,'18|35');assert.deepEqual(selected,['Komedi']);
