@@ -1,15 +1,15 @@
 const DEFAULT_PREFERENCES = Object.freeze({
-  enabled: false, episodes: true, seasons: true, reading: false, readingFollowUp: true, watching: false,
+  enabled: false, trailers: true, upcoming: true, upcomingTime: "10:00", episodes: true, seasons: true, reading: false, readingFollowUp: true, watching: false,
   quietEnabled: true, quietStart: "22:00", quietEnd: "09:00",
   delivery: "instant", digestTime: "20:00", reminderTime: "20:30", timeZone: "Europe/Istanbul",
 });
 const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
 function preferences(input = {}) {
   const result = { ...DEFAULT_PREFERENCES };
-  for (const key of ["enabled", "episodes", "seasons", "reading", "readingFollowUp", "watching", "quietEnabled"]) {
+  for (const key of ["enabled", "trailers", "upcoming", "episodes", "seasons", "reading", "readingFollowUp", "watching", "quietEnabled"]) {
     if (typeof input[key] === "boolean") result[key] = input[key];
   }
-  for (const key of ["quietStart", "quietEnd", "digestTime", "reminderTime"]) {
+  for (const key of ["upcomingTime", "quietStart", "quietEnd", "digestTime", "reminderTime"]) {
     if (timePattern.test(input[key] || "")) result[key] = input[key];
   }
   if (input.delivery === "daily") result.delivery = "daily";

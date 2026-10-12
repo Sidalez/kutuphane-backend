@@ -2420,7 +2420,7 @@ Yalnızca şu JSON'u döndür:
   return { text, books: suggestedBooks };
 }
 
-const notifications = require("./notifications").createNotificationService({ tmdbRequest, readBody, json });
+const notifications = require("./notifications").createNotificationService({ tmdbRequest, readBody, json, search: q => serperRequest("search", { q, gl: "tr", hl: "tr", num: 5 }) });
 const server = http.createServer(async (req, res) => {
   setCorsHeaders(res);
 

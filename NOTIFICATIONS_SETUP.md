@@ -55,3 +55,12 @@ Render ücretsiz servisi uyuyabileceği için yalnızca sunucudaki zamanlayıcı
 Takibe ilk açılışta geçmiş bölümler gönderilmez. Sonraki kontrollerde en fazla son yedi gündeki, son üç sezonun izlenmemiş bölümleri kontrol edilir. Aynı bölüm kimliği tekrar inbox kaydı oluşturmaz. Cihaz bazlı teslim makbuzları başarılı telefon gönderimlerinin tekrarlanmasını önler; Web Push teslimi ağ/işletim sistemi koşullarına bağlıdır. Bırakılan diziler takip edilmez. Tercihler hesap bazlı, telefon abonelikleri cihaz bazlıdır. Çıkışta cihazın push aboneliği iptal edilir.
 
 İlk sürüm gelen kutusunda son 100 kaydı gösterir. Üretim saklama politikan için Firestore TTL veya bakım göreviyle eski inbox ve teslim makbuzlarını temizle; mevcut kullanıcı verilerini toplu silme.
+
+
+## Film ve dizi keşif bildirimleri
+
+`trailers` ve `upcoming` tercihleri film ve dizi için ortaktır. Yaklaşan yayınlar kullanıcının saat diliminde `upcomingTime` (varsayılan 10:00) sonrasında iki gün önce oluşturulur; kaçırılan kontrol ertesi gün telafi edilir. Sessiz saatler ve günlük özet tercihi geçerlidir. Tarih değişirse eski bekleyen hatırlatma gönderilmez. Yayın günü geçmiş hatırlatmalar gönderilmez.
+
+Dizi fragmanları yalnızca TMDB'nin sıradaki bölüm videosu uç noktasından alınır. Film fragmanları film uç noktasından alınır. YouTube'da yayımlanan, TMDB'de resmî işaretlenmiş Trailer/Teaser videolarından son yedi gündeki en yenisi bildirilir; video kimliği tekrar gönderimi engeller. Bildirim merkezindeki oynat düğmesi fragmanı açar. Show TV için ayrıca resmî kanal sitesi Serper ile aranır. İlk sezon bölüm numarası ve h1 başlığı birebir eşleşmelidir; başka sezonlarda toplam bölüm numarası belirsizliğini önlemek için yalnızca TMDB kullanılır. Resmî kanal araştırması üç saat önbelleklenir.
+
+Film hatırlatmaları yalnızca TMDB Türkiye sinema (3) veya dijital (4) yayın kaydını kullanır. Türkiye kaydı yoksa tarih tahmin edilmez. TMDB tarih alanı yayın saati içermez; UTC gece yarısı gerçek yayın saati olarak gösterilmez. Show TV sayfasında yalnızca aynı dizinin haftalık yayın planı ve yayın gününün eşleşmesi halinde saat ayrıca, Türkiye saati olduğu belirtilerek gösterilir. Bu, kesin bölüm saati garantisi değildir. Diğer kanallar için şu anda TMDB kullanılır. Veriler 30 dakika önbelleklenir; kontrol işi aynı aralıkta keşif yapar. Dış hizmette eksik veri bildirimin oluşmamasına neden olabilir.

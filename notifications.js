@@ -1,3 +1,5 @@
+const { loadOfficialTrailer } = require('./officialTrailers');
+const { upcomingEvent, filmRelease, trailerEvents } = require('./mediaNotifications');
 const { createHash, timingSafeEqual } = require("node:crypto");
 const firebaseApp = require("firebase-admin/app");
 const { getFirestore, FieldPath } = require("firebase-admin/firestore");
@@ -17,7 +19,7 @@ const { activityPayload } = require("./readingActivity");
 const hash = value => createHash("sha256").update(value).digest("hex");
 const fail = (status, message) => Object.assign(new Error(message), { status });
 
-function createNotificationService({ tmdbRequest, readBody, json }, dependencies = {}) {
+function createNotificationService({ tmdbRequest, readBody, json, search }, dependencies = {}) {
   const admin = dependencies.admin || firebaseAdmin;
   const webpush = dependencies.webpush || webPush;
   let db, auth;
@@ -87,6 +89,66 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     if (tvCache.size > 500) tvCache.clear();
     tvCache.set(id, { value, expires: Date.now() + 15 * 60000 });
     return value;
+  }
+  const officialCache = new Map();
+  const discoveryCache = new Map();
+  async function discoveryRequest(path) {
+    const cached = discoveryCache.get(path);
+    if (cached && cached.expires > Date.now()) return cached.value;
+    const value = await tmdbRequest(path, { language: "tr-TR", include_video_language: "tr,en,null" });
+    if (discoveryCache.size >= 500) discoveryCache.clear();
+    discoveryCache.set(path, { value, expires: Date.now() + 30 * 60000 });
+    return value;
+  }
+  async function checkMediaDiscovery(uid, p, now) {
+    if (!p.trailers && !p.upcoming) return;
+    const media = await db.collection("mediaItems").where("userId", "==", uid).get();
+    const today = localClock(now,p.timeZone).date;
+    for (const doc of media.docs) {
+      const item = { ...doc.data(), id:doc.id };
+      if (!["TV","MOVIE"].includes(item.type) || item.status === "BIRAKILDI" || (item.type === "MOVIE" && item.status === "IZLENDI") || !Number.isSafeInteger(Number(item.tmdbId)) || Number(item.tmdbId) <= 0) continue;
+      try {
+        let release, path;
+        if (item.type === "TV") {
+          const next = (await tvDetails(Number(item.tmdbId))).next_episode_to_air;
+          if (!next || next.air_date <= today || !Number.isInteger(next.season_number) || !Number.isInteger(next.episode_number)) continue;
+          release = {date:next.air_date,season:next.season_number,episode:next.episode_number};
+          if ((item.watchedEpisodes || []).some(e=>e.seasonNumber===release.season && e.episodeNumber===release.episode)) continue;
+          path = `/tv/${item.tmdbId}/season/${release.season}/episode/${release.episode}/videos`;
+        } else {
+          release = filmRelease(await discoveryRequest(`/movie/${item.tmdbId}/release_dates`),today);
+          path = `/movie/${item.tmdbId}/videos`;
+        }
+        let official = null;
+        if (item.type === "TV" && release?.season === 1 && (p.trailers || p.upcoming)) {
+          const key = `${item.tmdbId}:${release.episode}:${release.date}`;
+          const cached = officialCache.get(key);
+          if (cached && cached.expires > Date.now()) official = cached.value;
+          else {
+            try { official = await loadOfficialTrailer(search,item.title,release); } catch {}
+            if (officialCache.size >= 500) officialCache.clear();
+            officialCache.set(key,{value:official,expires:Date.now()+3*60*60000});
+          }
+        }
+        if (p.upcoming && release) {
+          const event = upcomingEvent(item, release, now, p);
+          if (event) {
+            if (official?.schedule) event.body = event.body.replace("yayın saati açıklanmadı.",`Saat ${official.schedule}.`);
+            await createEvent(uid,event);
+          }
+        }
+        if (p.trailers) {
+          if (official) {
+            await createEvent(uid,{id:`trailer_tv_${item.id}_${release.season}_${release.episode}`,kind:"trailer",itemId:item.id,
+              title:`${item.title} · Yeni bölüm fragmanı`,body:`${release.season}. sezon, ${release.episode}. bölüm fragmanı Show TV’de yayımlandı.`,
+              url:`/media/${encodeURIComponent(item.id)}`,sourceUrl:official.sourceUrl});
+          } else {
+            const data = await discoveryRequest(path);
+            for (const event of trailerEvents(item,data.results,now,item.type === "TV" ? release : null)) await createEvent(uid,event);
+          }
+        }
+      } catch { console.warn("Bir içeriğin fragman veya yaklaşan yayın bilgisi alınamadı; yeniden denenecek."); }
+    }
   }
   async function checkSeries(uid, p, now) {
     const media = await db.collection("mediaItems").where("userId", "==", uid).get();
@@ -166,10 +228,25 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     const clock = localClock(now, p.timeZone);
     if (p.delivery === "daily" && clock.time < p.digestTime) return;
     const pending = await inbox(uid).where("pushState", "==", "pending").limit(100).get();
-    let allowed = pending.docs.filter(d => !d.data().read && !d.data().deleted && d.data().createdAt > (current.inboxClearedAt || 0) && (d.data().kind === "test" || p[{ episode: "episodes", season: "seasons", reading: "reading", readingFollowUp: "readingFollowUp", watching: "watching" }[d.data().kind]]) && now.getTime() - d.data().createdAt < 7 * 86400000);
+    let allowed = pending.docs.filter(d => !d.data().read && !d.data().deleted && d.data().createdAt > (current.inboxClearedAt || 0) && (d.data().kind === "test" || p[{ trailer: "trailers", upcoming: "upcoming", episode: "episodes", season: "seasons", reading: "reading", readingFollowUp: "readingFollowUp", watching: "watching" }[d.data().kind]]) && now.getTime() - d.data().createdAt < 7 * 86400000);
     if (allowed.some(d => d.data().kind === "readingFollowUp")) {
       const latest = await latestReadingSession(uid);
       allowed = allowed.filter(d => d.data().kind !== "readingFollowUp" || (latest && latest.book.id === d.data().bookId && latest.session.id === d.data().logId && now.getTime() < d.data().expiresAt));
+    }
+    for (const d of [...allowed]) {
+      const event = d.data();
+      if (!["trailer","upcoming"].includes(event.kind)) continue;
+      const item = (await db.collection("mediaItems").doc(event.itemId).get()).data();
+      let valid = item && item.userId === uid && item.status !== "BIRAKILDI" && !(item.type === "MOVIE" && item.status === "IZLENDI");
+      if (valid && event.kind === "upcoming") {
+        if (item.type === "TV") {
+          const next = (await tvDetails(Number(item.tmdbId))).next_episode_to_air;
+          valid = next?.air_date === event.airDate && !(item.watchedEpisodes || []).some(e=>e.seasonNumber===next.season_number && e.episodeNumber===next.episode_number);
+        }
+        else valid = filmRelease(await discoveryRequest(`/movie/${item.tmdbId}/release_dates`),clock.date)?.date === event.airDate;
+        valid = valid && event.airDate > clock.date;
+      }
+      if (!valid) allowed = allowed.filter(value=>value!==d);
     }
     for (const d of pending.docs) if (!allowed.includes(d)) await d.ref.update({ pushState: "skipped" });
     if (!allowed.length) return;
@@ -296,6 +373,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
       }
       if (!a.checkedAt || now.getTime() - a.checkedAt >= 30 * 60000) {
         await checkSeries(uid, a.preferences, now);
+        await checkMediaDiscovery(uid, a.preferences, now);
         await ref.set({ checkedAt: now.getTime() }, { merge: true });
       }
       await deliver(uid, a.preferences, now);
@@ -325,7 +403,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
     if (!pathname.startsWith("/api/notifications")) return false;
     try {
       if (req.method === "GET" && pathname === "/api/notifications/config") {
-        json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null, personalizedReading: true, readingFollowUp: true, readingActivity: true }); return true;
+        json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null, mediaDiscovery: true, personalizedReading: true, readingFollowUp: true, readingActivity: true }); return true;
       }
       if (req.method === "POST" && ["/api/notifications/run", "/api/notifications/broadcast-test"].includes(pathname)) {
         const expected = process.env.NOTIFICATION_CRON_SECRET || "";
@@ -367,7 +445,7 @@ function createNotificationService({ tmdbRequest, readBody, json }, dependencies
         // Disabling a type discards its queued pushes; re-enabling must not replay old reminders.
         const pending = await inbox(uid).where("pushState", "==", "pending").get();
         for (const d of pending.docs) {
-          const type = { episode: "episodes", season: "seasons", reading: "reading", readingFollowUp: "readingFollowUp", watching: "watching" }[d.data().kind];
+          const type = { trailer: "trailers", upcoming: "upcoming", episode: "episodes", season: "seasons", reading: "reading", readingFollowUp: "readingFollowUp", watching: "watching" }[d.data().kind];
           if (!next.enabled || (type && !next[type])) await d.ref.update({ pushState: "skipped" });
         }
         json(res, 200, { preferences: next }); return true;
