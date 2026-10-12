@@ -1,5 +1,5 @@
 const {test}=require('node:test');const assert=require('node:assert/strict');
-const {matchProvider,requestedProvider}=require('./mediaProviders');
+const {matchProvider,requestedProvider,selectProviderCatalog}=require('./mediaProviders');
 const providers=[{provider_id:2,provider_name:'Apple TV Store'},{provider_id:1904,provider_name:'TV+'},{provider_id:1899,provider_name:'HBO Max'},{provider_id:337,provider_name:'Disney Plus'},{provider_id:119,provider_name:'Amazon Prime Video'},{provider_id:8,provider_name:'Netflix'}];
 test('Platform aliases select the actual service without confusing store or TV+',()=>{
  assert.equal(matchProvider('Disney+',providers),337);
@@ -7,6 +7,13 @@ test('Platform aliases select the actual service without confusing store or TV+'
  assert.equal(matchProvider('TV+',providers),1904);
  assert.equal(matchProvider('Apple TV+',providers),null);
  assert.equal(matchProvider('Prime Video',providers),119);
+});
+test('Apple subscription uses its renamed service and an explicit international fallback',()=>{
+ const global=[{provider_id:350,provider_name:'Apple TV'}];
+ assert.equal(matchProvider('Apple TV+',global),350);
+ assert.deepEqual(selectProviderCatalog('Apple TV+',providers,global),{id:350,region:'US',fallback:true});
+ assert.deepEqual(selectProviderCatalog('Apple TV+',global,global),{id:350,region:'TR',fallback:false});
+ assert.deepEqual(selectProviderCatalog('Netflix',[],providers),{id:null,region:'TR',fallback:false});
 });
 test('A named platform in the request is respected and explicit choice wins',()=>{
  assert.equal(requestedProvider({description:'Netflix üzerinden mini dizi istiyorum'}),'Netflix');

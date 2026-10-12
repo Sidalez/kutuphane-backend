@@ -1,6 +1,6 @@
 function providerAliases(value) {
   const key=String(value||'').trim().toLocaleLowerCase('tr-TR');
-  const groups=[['netflix'],['amazon prime video','prime video','prime','amazon prime'],['disney+','disney plus','disney'],['apple tv+','apple tv plus'],['tv+','turkcell tv+'],['hbo max','max','blutv','blu tv'],['mubi'],['gain'],['tabii'],['exxen'],['puhutv']];
+  const groups=[['netflix'],['amazon prime video','prime video','prime','amazon prime'],['disney+','disney plus','disney'],['apple tv+','apple tv plus','apple tv'],['tv+','turkcell tv+'],['hbo max','max','blutv','blu tv'],['mubi'],['gain'],['tabii'],['exxen'],['puhutv']];
   return groups.find(group=>group.includes(key))||[key];
 }
 function matchProvider(value,providers) {
@@ -16,4 +16,11 @@ function requestedProvider(payload) {
   }
   return '';
 }
-module.exports={matchProvider,requestedProvider};
+function selectProviderCatalog(value, regional, international, region='TR') {
+  const localId=matchProvider(value,regional);
+  if(localId) return {id:localId,region,fallback:false};
+  const internationalId=matchProvider(value,international);
+  if(internationalId===350) return {id:internationalId,region:'US',fallback:true};
+  return {id:null,region,fallback:false};
+}
+module.exports={matchProvider,requestedProvider,selectProviderCatalog};

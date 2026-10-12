@@ -1,4 +1,4 @@
-const { matchProvider, requestedProvider } = require('./mediaProviders');
+const { matchProvider, requestedProvider, selectProviderCatalog } = require('./mediaProviders');
 const { recommendationIntent, matchesSeriesIntent, excludedKeys } = require('./mediaRecommendationIntent');
 const { qualityScore, reliableCandidate, balancedSelection } = require('./mediaRecommendationQuality');
 const { createMediaTitleResolver } = require('./mediaTitles');
@@ -1838,31 +1838,34 @@ function resolveGenreIds(selectedGenres, description, tmdbGenres) {
   return [...new Set(ids)];
 }
 
-async function getTmdbProviderList(type) {
-  if (tmdbProviderCache[type]) return tmdbProviderCache[type];
+async function getTmdbProviderList(type, region = TMDB_REGION) {
+  const cacheKey = `${type}:${region}`;
+  if (tmdbProviderCache[cacheKey]) return tmdbProviderCache[cacheKey];
 
   const endpoint =
     type === "TV" ? "/watch/providers/tv" : "/watch/providers/movie";
 
   const data = await tmdbRequest(endpoint, {
     language: TMDB_LANGUAGE,
-    watch_region: TMDB_REGION,
+    watch_region: region,
   });
 
   const providers = Array.isArray(data.results) ? data.results : [];
 
-  tmdbProviderCache[type] = providers;
+  tmdbProviderCache[cacheKey] = providers;
 
   return providers;
 }
 
+async function resolveProviderCatalog(providerName, type) {
+  const regional = await getTmdbProviderList(type);
+  const localId = matchProvider(providerName, regional);
+  if (localId) return {id:localId,region:TMDB_REGION,fallback:false};
+  const international = await getTmdbProviderList(type, "US");
+  return selectProviderCatalog(providerName,regional,international,TMDB_REGION);
+}
 async function resolveProviderId(providerName, type) {
-  const wanted = normalizeSuggestionText(providerName);
-
-  if (!wanted) return null;
-
-  const providers = await getTmdbProviderList(type);
-  return matchProvider(providerName, providers);
+  return (await resolveProviderCatalog(providerName,type)).id;
 }
 
 function getCandidateGenres(genreIds, tmdbGenres) {
@@ -2136,7 +2139,8 @@ async function discoverSuggestionsByType({
 
   const originalLanguage = intent.local && !intent.localOptional ? "tr" : inferOriginalLanguage(description, selectedGenres);
 
-  const providerId = provider ? await resolveProviderId(provider, type) : null;
+  const providerCatalog = provider ? await resolveProviderCatalog(provider, type) : null;
+  const providerId = providerCatalog?.id;
 
   const endpoint = type === "TV" ? "/discover/tv" : "/discover/movie";
 
@@ -2174,6 +2178,7 @@ async function discoverSuggestionsByType({
 
   if (provider && !providerId) return [];
   if (providerId) {
+    params.watch_region = providerCatalog.region;
     params.with_watch_providers = providerId;
     params.with_watch_monetization_types = "flatrate|free|ads";
   }
@@ -2748,10 +2753,12 @@ const server = http.createServer(async (req, res) => {
       const alreadyAddedSet = getHistoryAlreadyAddedSet(history);
       for (const key of excludedKeys(payload.excludedSuggestions)) alreadyAddedSet.add(key);
 
+      let catalogNotice = "";
       if (payload.provider) {
         const providerTypes = type === "ALL" ? ["MOVIE", "TV"] : [type];
-        const ids = await Promise.all(providerTypes.map(currentType => resolveProviderId(payload.provider, currentType)));
-        if (!ids.some(Boolean)) return json(res, 200, {
+        const catalogs = await Promise.all(providerTypes.map(currentType => resolveProviderCatalog(payload.provider, currentType)));
+        if (catalogs.some(catalog=>catalog.fallback)) catalogNotice = "Apple TV+ önerileri uluslararası katalogdan getirildi. Türkiye’deki erişimi Apple TV üzerinden kontrol edebilirsin.";
+        if (!catalogs.some(catalog=>catalog.id)) return json(res, 200, {
           success: true, mode, data: [],
           message: `${payload.provider} için Türkiye kataloğu veri kaynağında bulunamadı. Başka bir platform seçebilirsin.`,
         });
@@ -2808,10 +2815,11 @@ const server = http.createServer(async (req, res) => {
 
       if (payload.provider && ["SIMILAR", "WATCHING_SIMILAR"].includes(mode)) {
         const matches = await Promise.all(suggestions.map(async item => {
-          const id = await resolveProviderId(payload.provider, item.type);
+          const catalog = await resolveProviderCatalog(payload.provider, item.type);
+          const id = catalog.id;
           if (!id) return false;
           const data = await tmdbRequest(`/${item.type === "TV" ? "tv" : "movie"}/${item.tmdbId}/watch/providers`).catch(() => ({results:{}}));
-          const region = data.results?.[TMDB_REGION] || {};
+          const region = data.results?.[catalog.region] || {};
           return ["flatrate", "free", "ads"].some(key => (region[key] || []).some(provider => provider.provider_id === id));
         }));
         suggestions = suggestions.filter((item,index)=>matches[index]);
@@ -2833,6 +2841,7 @@ const server = http.createServer(async (req, res) => {
         success: true,
         mode,
         data: titledSuggestions.filter(Boolean),
+        notice: catalogNotice || undefined,
       });
     }
 
