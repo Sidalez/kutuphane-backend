@@ -1,3 +1,4 @@
+const { createMediaTitleResolver } = require('./mediaTitles');
 // backend/server.js
 // Node 18+ gerektirir.
 // Kitap: ISBN -> Serper Images ilk title + ilk imageUrl -> Gemini detayları
@@ -611,6 +612,8 @@ async function tmdbRequest(endpoint, params = {}) {
 
   return data;
 }
+
+const resolveMediaTitle = createMediaTitleResolver(tmdbRequest);
 
 function normalizeMovieSearchResult(item) {
   return {
@@ -1310,7 +1313,7 @@ async function getTurkishMediaDetailsForSuggestion({ tmdbId, type }) {
       imdbId: details.external_ids?.imdb_id || details.imdb_id || null,
       type: "MOVIE",
 
-      title: details.title || details.original_title || "",
+      title: await resolveMediaTitle({ tmdbId: details.id, type: "MOVIE", title: details.title || details.original_title }) || "Film",
       originalTitle: details.original_title || details.title || "",
       year: details.release_date ? details.release_date.slice(0, 4) : "",
 
@@ -1361,7 +1364,7 @@ async function getTurkishMediaDetailsForSuggestion({ tmdbId, type }) {
     imdbId: details.external_ids?.imdb_id || null,
     type: "TV",
 
-    title: details.name || details.original_name || "",
+    title: await resolveMediaTitle({ tmdbId: details.id, type: "TV", title: details.name || details.original_name }) || "Dizi",
     originalTitle: details.original_name || details.name || "",
     year: details.first_air_date ? details.first_air_date.slice(0, 4) : "",
 
@@ -2799,10 +2802,14 @@ const server = http.createServer(async (req, res) => {
         history,
       });
 
+      const titledSuggestions = await Promise.all(aiSuggestions.map(async item => {
+        const title = await resolveMediaTitle(item);
+        return title ? { ...item, title } : null;
+      }));
       return json(res, 200, {
         success: true,
         mode,
-        data: aiSuggestions,
+        data: titledSuggestions.filter(Boolean),
       });
     }
 
