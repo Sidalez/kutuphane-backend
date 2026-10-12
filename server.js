@@ -1,3 +1,4 @@
+const { withProcessing, recordModel, processingInfo } = require('./aiProvenance');
 const { matchProvider, requestedProvider, selectProviderCatalog } = require('./mediaProviders');
 const { recommendationIntent, matchesSeriesIntent, excludedKeys } = require('./mediaRecommendationIntent');
 const { qualityScore, reliableCandidate, balancedSelection } = require('./mediaRecommendationQuality');
@@ -205,7 +206,7 @@ async function callOpenRouter(prompt, temperature = 0.3) {
   const endpoint = GROQ_API_KEY ? "https://api.groq.com/openai/v1/chat/completions" : "https://openrouter.ai/api/v1/chat/completions";
   const cacheKey = require("crypto").createHash("sha256").update(JSON.stringify([AI_PROVIDER, model, prompt, temperature])).digest("hex");
   const cached = openRouterCache.get(cacheKey);
-  if (cached && cached.expires > Date.now()) return cached.text;
+  if (cached && cached.expires > Date.now()) { recordModel(providerName,cached.model || model,true); return cached.text; }
   let response, data;
   try {
   response = await fetch(endpoint, {
@@ -235,7 +236,8 @@ async function callOpenRouter(prompt, temperature = 0.3) {
     throw new Error("Ücretsiz model tamamlanmış bir yanıt üretemedi. Lütfen tekrar dene.");
   }
   if (openRouterCache.size >= 100) openRouterCache.delete(openRouterCache.keys().next().value);
-  openRouterCache.set(cacheKey, { text: text.trim(), expires: Date.now() + 30 * 60 * 1000 });
+  recordModel(providerName,data.model || model);
+  openRouterCache.set(cacheKey, { model:data.model || model, text: text.trim(), expires: Date.now() + 30 * 60 * 1000 });
   return text.trim();
 }
 
@@ -322,6 +324,7 @@ async function callGemini({
       throw new Error("Gemini cevabı okunamadı.");
     }
 
+    recordModel("Google Gemini",data.modelVersion || GEMINI_MODEL);
     return text;
   }
 
@@ -1461,7 +1464,9 @@ async function callGeminiJson(prompt) {
       ?.map((part) => part.text || "")
       .join("") || "";
 
-  return safeJsonParseFromGemini(text);
+  const parsed = safeJsonParseFromGemini(text);
+  if (parsed) recordModel("Google Gemini",data.modelVersion || model);
+  return parsed;
 }
 
 async function aiPolishTurkishDetails(details) {
@@ -2351,7 +2356,7 @@ Yalnızca şu JSON'u döndür:
       summary: "",
       reason: [book.status === "OKUNUYOR" ? "Okumaya başladığın bu kitaba kaldığın yerden devam edebilirsin." : "Kütüphanende okunmayı bekliyor.", matches.length ? `Tercihinle eşleşen tür: ${matches.join(", ")}.` : "", book.expectedRating ? "Beklenti puanın da seçimde dikkate alındı." : ""].filter(Boolean).join(" "),
     }));
-    return { source: "library_rules", books, text: ["Kısa Profil Özeti", "- AI servisine erişilemediği için bu seçimler kütüphanendeki durum, puan ve tür bilgilerine göre hazırlandı.", "Kesinlikle Başlaman Gerekenler", ...books.map(book => `- Kitap: ${book.title} | Yazar: ${book.author} | Neden: ${book.reason}`)].join("\n") };
+    return { processing:processingInfo("library_rules"), source: "library_rules", books, text: ["Kısa Profil Özeti", "- AI servisine erişilemediği için bu seçimler kütüphanendeki durum, puan ve tür bilgilerine göre hazırlandı.", "Kesinlikle Başlaman Gerekenler", ...books.map(book => `- Kitap: ${book.title} | Yazar: ${book.author} | Neden: ${book.reason}`)].join("\n") };
   }
   const result = parseJsonFromText(raw, null);
   if (!result || !Array.isArray(result.recommendations)) throw new Error("Öneriler okunamadı. Lütfen tekrar dene.");
@@ -2424,11 +2429,11 @@ Yalnızca şu JSON'u döndür:
   const text = ["Kısa Profil Özeti", `- ${cleanText(result.profile) || "Tercihlerine göre kitaplar seçildi."}`,
     "Öneri Stratejisi", `- ${cleanText(result.strategy) || "Ruh halin ve ayırdığın süre dikkate alındı."}`,
     goal === "choose_library_book" ? "Kesinlikle Başlaman Gerekenler" : "Satın Alabileceğin Öneriler", ...items].join("\n");
-  return { text, books: suggestedBooks };
+  return { text, books: suggestedBooks, processing:processingInfo("book_recommendations") };
 }
 
 const notifications = require("./notifications").createNotificationService({ tmdbRequest, readBody, json, search: q => serperRequest("search", { q, gl: "tr", hl: "tr", num: 5 }) });
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => withProcessing(async () => {
   setCorsHeaders(res);
 
   if (req.method === "OPTIONS") {
@@ -2534,6 +2539,7 @@ const server = http.createServer(async (req, res) => {
 
       return json(res, 200, {
         success: true,
+        processing: processingInfo("isbn_web_research"),
         data: {
           ...book,
           isbn,
@@ -2842,6 +2848,7 @@ const server = http.createServer(async (req, res) => {
         mode,
         data: titledSuggestions.filter(Boolean),
         notice: catalogNotice || undefined,
+        processing: processingInfo("tmdb_recommendations"),
       });
     }
 
@@ -2862,7 +2869,7 @@ const server = http.createServer(async (req, res) => {
       message: err?.message || "Sunucu tarafında beklenmeyen hata oluştu.",
     });
   }
-});
+}));
 
 server.listen(PORT, () => {
   console.log(`🚀 Backend çalışıyor: http://localhost:${PORT}`);
