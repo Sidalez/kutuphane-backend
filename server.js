@@ -1,3 +1,4 @@
+const { qualityScore, reliableCandidate, balancedSelection } = require('./mediaRecommendationQuality');
 const { createMediaTitleResolver } = require('./mediaTitles');
 // backend/server.js
 // Node 18+ gerektirir.
@@ -1609,9 +1610,10 @@ ${JSON.stringify(detailed, null, 2)}
       };
     });
 
-    return merged.sort(
-      (a, b) => Number(b.matchScore || 0) - Number(a.matchScore || 0)
-    );
+    return merged.sort((a,b) => {
+      const score = item => Number(item.qualityScore || 6.5)*7 + Math.min(95,Math.max(0,Number(item.matchScore)||0))*.3;
+      return score(b)-score(a);
+    });
   } catch (err) {
     console.warn("Gemini öneri iyileştirme başarısız:", err?.message);
     return suggestions;
@@ -1903,40 +1905,12 @@ function getCandidateGenres(genreIds, tmdbGenres) {
 }
 
 function calculateSuggestionScore(item, context) {
-  let score = 60;
-
-  const voteAverage = Number(item.vote_average || 0);
-  const popularity = Number(item.popularity || 0);
-  const voteCount = Number(item.vote_count || 0);
-
-  if (voteAverage >= 8) score += 16;
-  else if (voteAverage >= 7.2) score += 11;
-  else if (voteAverage >= 6.5) score += 6;
-
-  if (popularity > 100) score += 8;
-  else if (popularity > 50) score += 5;
-  else if (popularity > 20) score += 2;
-
-  if (voteCount > 1000) score += 5;
-  else if (voteCount > 300) score += 3;
-
-  if (context.provider) score += 4;
-
-  if (Array.isArray(context.genreIds) && context.genreIds.length > 0) {
-    score += 6;
-  }
-
-  if (context.originalLanguage) score += 5;
-
-  if (context.mode === "HIGH_RATED_UNWATCHED" && voteAverage >= 7.5) {
-    score += 8;
-  }
-
-  if (context.mode === "WEEKEND") {
-    score += 5;
-  }
-
-  return Math.max(0, Math.min(99, Math.round(score)));
+  let score = qualityScore(item.vote_average, item.vote_count) * 10;
+  const overlap = (item.genre_ids || []).filter(id => (context.genreIds || []).includes(id)).length;
+  score += Math.min(overlap * 2, 6);
+  if (context.originalLanguage && item.original_language === context.originalLanguage) score += 3;
+  if (context.seedTitle) score += 4;
+  return Math.min(95, Math.round(score));
 }
 
 function buildSuggestionReason(candidate, context) {
@@ -1995,6 +1969,8 @@ function normalizeSuggestionCandidate(item, type, genreList, context = {}) {
       genres,
     }),
     matchScore: calculateSuggestionScore(item, context),
+    voteCount: Number(item.vote_count || 0),
+    qualityScore: qualityScore(item.vote_average, item.vote_count),
   };
 }
 
@@ -2083,7 +2059,7 @@ async function getSimilarSuggestions({ seed, alreadyAddedSet, limit = 12 }) {
     seed.item.original_title ||
     seed.item.original_name;
 
-  const candidates = rawItems.map((item) =>
+  const candidates = rawItems.filter(item => reliableCandidate(item, type)).map((item) =>
     normalizeSuggestionCandidate(item, type, genreList, {
       mode: "SIMILAR",
       seedTitle,
@@ -2127,7 +2103,7 @@ async function getWatchingSimilarSuggestions({ history, alreadyAddedSet }) {
       ...(Array.isArray(similar.results) ? similar.results : []),
     ];
 
-    rawItems.forEach((item) => {
+    rawItems.filter(item => reliableCandidate(item, type)).forEach((item) => {
       allCandidates.push(
         normalizeSuggestionCandidate(item, type, genreList, {
           mode: "WATCHING_SIMILAR",
@@ -2140,16 +2116,16 @@ async function getWatchingSimilarSuggestions({ history, alreadyAddedSet }) {
   return dedupeAndFilterSuggestions(allCandidates, alreadyAddedSet, 12);
 }
 
-function inferPreferredGenresFromHistory(history) {
+function inferPreferredGenresFromHistory(history, type) {
   const values = [];
 
-  const collections = [history?.liked, history?.highRated, history?.completed];
+  const collections = [history?.highRated, history?.liked, history?.watching];
 
   collections.forEach((collection) => {
     if (!Array.isArray(collection)) return;
 
     collection.forEach((item) => {
-      if (Array.isArray(item?.genres)) {
+      if ((!type || item?.type === type) && Array.isArray(item?.genres)) {
         values.push(...item.genres);
       }
     });
@@ -2170,9 +2146,9 @@ async function discoverSuggestionsByType({
 }) {
   const genreList = await getTmdbGenreList(type);
 
-  const inferredGenres = inferPreferredGenresFromHistory(history);
+  const inferredGenres = inferPreferredGenresFromHistory(history, type);
   const genreIds = resolveGenreIds(
-    [...asStringArray(selectedGenres), ...inferredGenres],
+    asStringArray(selectedGenres).length || description.trim() ? asStringArray(selectedGenres) : inferredGenres,
     description,
     genreList
   );
@@ -2188,13 +2164,15 @@ async function discoverSuggestionsByType({
     include_adult: "false",
     page: 1,
     sort_by: "popularity.desc",
-    vote_count_gte: type === "TV" ? 80 : 150,
+    "vote_count.gte": type === "TV" ? 100 : 300,
+    "vote_average.gte": 6.0,
     watch_region: TMDB_REGION,
   };
 
   if (mode === "HIGH_RATED_UNWATCHED") {
     params.sort_by = "vote_average.desc";
-    params.vote_count_gte = type === "TV" ? 250 : 350;
+    params["vote_count.gte"] = type === "TV" ? 300 : 1000;
+    params["vote_average.gte"] = 7;
   }
 
   if (mode === "WEEKEND") {
@@ -2206,13 +2184,14 @@ async function discoverSuggestionsByType({
   }
 
   if (genreIds.length > 0) {
-    params.with_genres = genreIds.join(",");
+    params.with_genres = genreIds.join("|");
   }
 
   if (originalLanguage) {
     params.with_original_language = originalLanguage;
   }
 
+  if (provider && !providerId) return [];
   if (providerId) {
     params.with_watch_providers = providerId;
   }
@@ -2221,7 +2200,7 @@ async function discoverSuggestionsByType({
 
   const rawItems = Array.isArray(data.results) ? data.results : [];
 
-  const candidates = rawItems.map((item) =>
+  const candidates = rawItems.filter(item => reliableCandidate(item, type)).map((item) =>
     normalizeSuggestionCandidate(item, type, genreList, {
       mode,
       provider,
@@ -2251,6 +2230,15 @@ async function getDiscoverySuggestions(payload) {
       : [type];
 
   const allCandidates = [];
+  if (["PERSONAL", "TODAY"].includes(mode) && !provider && !selectedGenres.length && !description.trim()) {
+    const seeds = [...(history.highRated || []), ...(history.watching || [])]
+      .filter(item => item.tmdbId && types.includes(item.type))
+      .filter((item,index,all) => all.findIndex(other=>other.type===item.type && other.tmdbId===item.tmdbId)===index).slice(0,3);
+    for (const item of seeds) {
+      const candidates = await getSimilarSuggestions({seed:{type:item.type,item:{id:item.tmdbId,title:item.title,name:item.title}},alreadyAddedSet,limit:12});
+      allCandidates.push(...candidates);
+    }
+  }
 
   for (const currentType of types) {
     const candidates = await discoverSuggestionsByType({
@@ -2267,7 +2255,7 @@ async function getDiscoverySuggestions(payload) {
     allCandidates.push(...candidates);
   }
 
-  return dedupeAndFilterSuggestions(allCandidates, alreadyAddedSet, 12);
+  return balancedSelection(dedupeAndFilterSuggestions(allCandidates, alreadyAddedSet, 100), type === "ALL" && mode === "WEEKEND" ? "MOVIE" : type, 12);
 }
 // ----------------------------------------------------------------
 // SERVER
@@ -2802,7 +2790,8 @@ const server = http.createServer(async (req, res) => {
         history,
       });
 
-      const titledSuggestions = await Promise.all(aiSuggestions.map(async item => {
+      const selectedSuggestions = balancedSelection(aiSuggestions, mode === "WEEKEND" && type === "ALL" ? "MOVIE" : type, 12);
+      const titledSuggestions = await Promise.all(selectedSuggestions.map(async item => {
         const title = await resolveMediaTitle(item);
         return title ? { ...item, title } : null;
       }));
