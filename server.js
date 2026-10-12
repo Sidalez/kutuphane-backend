@@ -2441,6 +2441,7 @@ Yalnızca şu JSON'u döndür:
 }
 
 const notifications = require("./notifications").createNotificationService({ tmdbRequest, readBody, json, search: q => serperRequest("search", { q, gl: "tr", hl: "tr", num: 5 }) });
+const deviceSessions=require('./deviceSessions').createDeviceSessionService({db:notifications.db,auth:notifications.auth,readBody,json});
 const server = http.createServer((req, res) => withProcessing(async () => {
   setCorsHeaders(res);
 
@@ -2455,6 +2456,7 @@ const server = http.createServer((req, res) => withProcessing(async () => {
   const pathname = url.pathname;
 
   try {
+    if (await deviceSessions.handle(req,res,pathname))return;
     if (await notifications.handle(req, res, pathname)) return;
     if (req.method === "POST" && pathname === "/api/ai/recommend") {
       try {

@@ -1,0 +1,26 @@
+rules_version = '2';
+service cloud.firestore {
+ match /databases/{database}/documents {
+  function signedIn(){return request.auth != null;}
+  function active(){
+   return signedIn() && 'sessionId' in request.auth.token &&
+    get(/databases/$(database)/documents/users/$(request.auth.uid)).data.deviceSessions[request.auth.token.sessionId].revokedAt == null;
+  }
+  function ownsBook(bookId){return active() && get(/databases/$(database)/documents/books/$(bookId)).data.userId == request.auth.uid;}
+  match /users/{uid} {
+   allow get: if active() && request.auth.uid == uid;
+   allow create: if active() && request.auth.uid == uid && !('deviceSessions' in request.resource.data);
+   allow update: if active() && request.auth.uid == uid && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['deviceSessions']);
+   match /goals/{id} {allow read,write: if active() && request.auth.uid == uid;}
+  }
+  match /{collection}/{id} {
+   allow get: if active() && collection in ['books','mediaItems','watchLogs','mediaShelves'] && (resource == null || resource.data.userId == request.auth.uid);
+   allow list,delete: if active() && collection in ['books','mediaItems','watchLogs','mediaShelves'] && resource.data.userId == request.auth.uid;
+   allow create: if active() && collection in ['books','mediaItems','watchLogs','mediaShelves'] && request.resource.data.userId == request.auth.uid;
+   allow update: if active() && collection in ['books','mediaItems','watchLogs','mediaShelves'] && resource.data.userId == request.auth.uid && request.resource.data.userId == request.auth.uid;
+  }
+  match /books/{bookId}/{subcollection}/{id} {
+   allow read,write: if ownsBook(bookId) && subcollection in ['logs','notes','sessions'];
+  }
+ }
+}

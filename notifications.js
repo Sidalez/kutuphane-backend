@@ -59,7 +59,13 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
     const token = /^Bearer (.+)$/.exec(req.headers.authorization || "")?.[1];
     if (!token) throw fail(401, "Bildirimlerini görmek için giriş yapmalısın.");
     let uid;
-    try { uid = (await auth.verifyIdToken(token)).uid; } catch { throw fail(401, "Oturumun doğrulanamadı. Tekrar giriş yap."); }
+    try {
+      const decoded=await auth.verifyIdToken(token,true);uid=decoded.uid;
+      if(process.env.SECURE_SESSIONS_REQUIRED==='true'){
+        const session=decoded.sessionId&&(await db.collection('users').doc(uid).get()).data()?.deviceSessions?.[decoded.sessionId];
+        if(!session||session.revokedAt)throw new Error('revoked');
+      }
+    } catch { throw fail(401, "Oturumun doğrulanamadı. Tekrar giriş yap."); }
     const now = Date.now();
     if (rates.size > 5000) for (const [key, value] of rates) if (value.until < now) rates.delete(key);
     const rate = rates.get(uid);
@@ -270,7 +276,9 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
       if ((await digestRef.get()).data()?.done) return;
       if (!await claim(digestRef, 2 * 60000)) return;
       const payload = { id: `digest_${clock.date}`, title: "Günlük özetin hazır", body: `${allowed.length} yeni gelişme seni bekliyor. ${allowed[0].data().title}`, url: "/notifications" };
+      await createEvent(uid,{...payload,kind:'digest'},'sending');
       await sendDevices(uid, devices, payload);
+      await inbox(uid).doc(payload.id).update({pushState:'sent'});
       await digestRef.set({ done: true, leaseUntil: 0 });
       for (const d of allowed) await d.ref.update({ pushState: "sent" });
     } else {
@@ -287,14 +295,18 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
     const counts = { accepted: 0, alreadySent: 0, expired: 0, failed: 0 };
     for (const device of devices.docs) {
       const delivery = accounts().doc(uid).collection("receipts").doc(hash(`${payload.id}:${device.id}`));
-      if ((await delivery.get()).exists) { counts.alreadySent++; continue; }
+      if ((await delivery.get()).data()?.createdAt) { counts.alreadySent++; continue; }
+      if(!await claim(delivery,30000)){failed=true;counts.failed++;continue;}
       try {
+        if((await delivery.get()).data()?.createdAt){counts.alreadySent++;continue;}
         await webpush.sendNotification(device.data().subscription, JSON.stringify({ title: payload.title, body: payload.body, url: payload.url, tag: payload.id }), { TTL: 86400, timeout: 10000 });
         await delivery.set({ createdAt: Date.now() });
         counts.accepted++;
       } catch (error) {
         if (error.statusCode === 404 || error.statusCode === 410) { await device.ref.delete(); counts.expired++; }
         else { failed = true; counts.failed++; }
+      } finally {
+        await delivery.set({leaseUntil:0},{merge:true});
       }
     }
     if (failed) throw Object.assign(fail(502, "Bildirim gönderilemedi. Biraz sonra yeniden denenecek."), { counts });
@@ -522,6 +534,6 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
     const timer = setInterval(() => run().catch(() => console.error("Bildirim kontrolü tamamlanamadı.")), 60000);
     timer.unref();
   }
-  return { handle, run, ready };
+  return { handle, run, ready, db, auth };
 }
 module.exports = { createNotificationService };
