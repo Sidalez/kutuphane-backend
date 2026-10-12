@@ -226,3 +226,23 @@ test("authenticated flow: baseline, deduplication, retries, account isolation, q
     assert.equal((await request("alice", "")).body.items.length, aliceCount);
   } finally { process.env = original; }
 });
+
+test('Scheduled check resumes completed series transactionally and respects dropped series', async () => {
+  const original={...process.env};
+  process.env.FIREBASE_SERVICE_ACCOUNT_JSON='{}';process.env.NOTIFICATION_POLLING='false';
+  process.env.VAPID_PUBLIC_KEY='test-public';process.env.VAPID_PRIVATE_KEY='test-private';
+  const db=fakeFirestore();const today=localClock(new Date(),'Europe/Istanbul').date;
+  const sdk={credential:{cert:()=>({})},initializeApp:()=>({firestore:()=>db,auth:()=>({verifyIdToken:async()=>({uid:'alice'})})}),firestore:{FieldPath:{documentId:()=>'__name__'}}};
+  const service=createNotificationService({tmdbRequest:async()=>({seasons:[],last_episode_to_air:{season_number:1,episode_number:11,air_date:today,name:'Yeni bölüm'}}),readBody:async req=>req.body,json:(res,status,body)=>Object.assign(res,{status,body})},{admin:sdk,webpush:{setVapidDetails(){}}});
+  async function request(path,body){const res={};await service.handle({method:body===undefined?'GET':'POST',headers:{authorization:'Bearer alice'},body},res,'/api/notifications'+path);return res;}
+  try {
+    await request('/preferences',{enabled:true,episodes:false,trailers:false,upcoming:false});
+    const watched=Array.from({length:10},(_,i)=>({seasonNumber:1,episodeNumber:i+1}));
+    for(const [id,status] of [['complete','IZLENDI'],['dropped','BIRAKILDI']]) await db.collection('mediaItems').doc(id).set({userId:'alice',tmdbId:42,type:'TV',title:'Dizi',status,watchedEpisodes:watched,completedAt:'2026-05-01',userRating:4});
+    assert.equal((await request('/check',{})).status,200);
+    const saved=(await db.collection('mediaItems').doc('complete').get()).data();
+    assert.equal(saved.status,'IZLENIYOR');assert.equal(saved.completedAt,null);assert.equal(saved.previousCompletedAt,'2026-05-01');assert.deepEqual(saved.watchedEpisodes,watched);assert.equal(saved.userRating,4);
+    assert.equal((await db.collection('mediaItems').doc('dropped').get()).data().status,'BIRAKILDI');
+    assert.equal((await request('')).body.items.length,0); // Opting out of episode alerts does not prevent state synchronization.
+  } finally {process.env=original;}
+});

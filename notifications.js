@@ -1,3 +1,4 @@
+const { shouldResumeSeries } = require('./seriesStatus');
 const { loadOfficialTrailer } = require('./officialTrailers');
 const { upcomingEvent, filmRelease, trailerEvents } = require('./mediaNotifications');
 const { createHash, timingSafeEqual } = require("node:crypto");
@@ -163,6 +164,18 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
         // Establish a baseline on first follow; never notify years of historical episodes.
         const since = state?.since || today;
         const events = [];
+        const latest = details.last_episode_to_air;
+        if (shouldResumeSeries(item, latest, today)) {
+          const resumed = await db.runTransaction(async tx => {
+            const current = (await tx.get(doc.ref)).data();
+            if (!current || current.userId !== uid || !shouldResumeSeries(current, latest, today)) return false;
+            tx.set(doc.ref, { status: "IZLENIYOR", completedAt: null, completedDate: null,
+              previousCompletedAt: current.completedAt || current.completedDate || null,
+              autoResumedAt: now.getTime(), autoResumeReason: "new_episode", updatedAt: now.getTime() }, { merge: true });
+            return true;
+          });
+          if (resumed && p.episodes) events.push(...episodeEvents(item, [latest], latest.air_date, today));
+        }
         if (p.episodes && state) {
           const lookback = new Date(now.getTime() - 7 * 86400000).toISOString().slice(0, 10);
           const cutoff = since > lookback ? since : lookback;
@@ -403,7 +416,7 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
     if (!pathname.startsWith("/api/notifications")) return false;
     try {
       if (req.method === "GET" && pathname === "/api/notifications/config") {
-        json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null, mediaDiscovery: true, personalizedReading: true, readingFollowUp: true, readingActivity: true }); return true;
+        json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null, seriesAutoResume: true, mediaDiscovery: true, personalizedReading: true, readingFollowUp: true, readingActivity: true }); return true;
       }
       if (req.method === "POST" && ["/api/notifications/run", "/api/notifications/broadcast-test"].includes(pathname)) {
         const expected = process.env.NOTIFICATION_CRON_SECRET || "";
