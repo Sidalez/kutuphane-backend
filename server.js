@@ -1,3 +1,4 @@
+const { matchProvider, requestedProvider } = require('./mediaProviders');
 const { recommendationIntent, matchesSeriesIntent, excludedKeys } = require('./mediaRecommendationIntent');
 const { qualityScore, reliableCandidate, balancedSelection } = require('./mediaRecommendationQuality');
 const { createMediaTitleResolver } = require('./mediaTitles');
@@ -1860,38 +1861,8 @@ async function resolveProviderId(providerName, type) {
 
   if (!wanted) return null;
 
-  const aliasMap = {
-    netflix: ["netflix"],
-    prime: ["amazon prime video", "prime video", "amazon"],
-    amazon: ["amazon prime video", "prime video", "amazon"],
-    "amazon prime": ["amazon prime video", "prime video", "amazon"],
-    "amazon prime video": ["amazon prime video", "prime video", "amazon"],
-    disney: ["disney plus", "disney+"],
-    "disney+": ["disney plus", "disney+"],
-    "apple tv": ["apple tv plus", "apple tv+", "apple tv"],
-    "apple tv+": ["apple tv plus", "apple tv+", "apple tv"],
-    "tv+": ["apple tv plus", "apple tv+", "apple tv"],
-    "hbo": ["hbo max", "max"],
-    "max": ["hbo max", "max"],
-    "mubi": ["mubi"],
-    "blutv": ["blutv", "blu tv"],
-    "gain": ["gain"],
-  };
-
-  const providerAliases = aliasMap[wanted] || [wanted];
-
   const providers = await getTmdbProviderList(type);
-
-  const found = providers.find((provider) => {
-    const name = normalizeSuggestionText(provider.provider_name);
-
-    return providerAliases.some((alias) => {
-      const normalizedAlias = normalizeSuggestionText(alias);
-      return name.includes(normalizedAlias) || normalizedAlias.includes(name);
-    });
-  });
-
-  return found?.provider_id || null;
+  return matchProvider(providerName, providers);
 }
 
 function getCandidateGenres(genreIds, tmdbGenres) {
@@ -2204,6 +2175,7 @@ async function discoverSuggestionsByType({
   if (provider && !providerId) return [];
   if (providerId) {
     params.with_watch_providers = providerId;
+    params.with_watch_monetization_types = "flatrate|free|ads";
   }
 
   if (intent.mini) params.with_type = "2";
@@ -2768,12 +2740,22 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && pathname === "/api/media/suggestions") {
       const payload = await readBody(req);
+      payload.provider = requestedProvider(payload);
 
       const mode = normalizeSuggestionMode(payload.mode);
       const type = normalizeSuggestionType(payload.type);
       const history = payload.history || {};
       const alreadyAddedSet = getHistoryAlreadyAddedSet(history);
       for (const key of excludedKeys(payload.excludedSuggestions)) alreadyAddedSet.add(key);
+
+      if (payload.provider) {
+        const providerTypes = type === "ALL" ? ["MOVIE", "TV"] : [type];
+        const ids = await Promise.all(providerTypes.map(currentType => resolveProviderId(payload.provider, currentType)));
+        if (!ids.some(Boolean)) return json(res, 200, {
+          success: true, mode, data: [],
+          message: `${payload.provider} için Türkiye kataloğu veri kaynağında bulunamadı. Başka bir platform seçebilirsin.`,
+        });
+      }
 
       console.log("✨ Medya öneri isteği:", {
         mode,
@@ -2813,7 +2795,7 @@ const server = http.createServer(async (req, res) => {
         suggestions = await getSimilarSuggestions({
           seed,
           alreadyAddedSet,
-          limit: 12,
+          limit: payload.provider ? 40 : 12,
         });
       } else if (mode === "WATCHING_SIMILAR") {
         suggestions = await getWatchingSimilarSuggestions({
@@ -2822,6 +2804,17 @@ const server = http.createServer(async (req, res) => {
         });
       } else {
         suggestions = await getDiscoverySuggestions(payload);
+      }
+
+      if (payload.provider && ["SIMILAR", "WATCHING_SIMILAR"].includes(mode)) {
+        const matches = await Promise.all(suggestions.map(async item => {
+          const id = await resolveProviderId(payload.provider, item.type);
+          if (!id) return false;
+          const data = await tmdbRequest(`/${item.type === "TV" ? "tv" : "movie"}/${item.tmdbId}/watch/providers`).catch(() => ({results:{}}));
+          const region = data.results?.[TMDB_REGION] || {};
+          return ["flatrate", "free", "ads"].some(key => (region[key] || []).some(provider => provider.provider_id === id));
+        }));
+        suggestions = suggestions.filter((item,index)=>matches[index]);
       }
 
       const aiSuggestions = await aiEnhanceSuggestionsWithGemini({
