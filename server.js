@@ -80,6 +80,11 @@ function setCorsHeaders(res) {
 function json(res, status, data) {
   if (res.writableEnded) return;
 
+  if (status >= 400 && data && typeof data === "object") {
+    const errorId = `ERR-${require("crypto").randomUUID().slice(0,8).toUpperCase()}`;
+    data = {...data, errorId};
+    console.error(`[${errorId}] HTTP ${status}`);
+  }
   setCorsHeaders(res);
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
