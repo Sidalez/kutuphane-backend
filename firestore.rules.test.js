@@ -6,7 +6,7 @@ test('Firestore enforces device revocation, account isolation and server-owned s
  try{
  await env.withSecurityRulesDisabled(async ctx=>{const db=ctx.firestore();await setDoc(doc(db,'users','u'),{deviceSessions:{a:{revokedAt:null},b:{revokedAt:null}}});await setDoc(doc(db,'users','v'),{deviceSessions:{v:{revokedAt:null}}});await setDoc(doc(db,'books','book'),{userId:'u',title:'Kitap'});});
  const a=env.authenticatedContext('u',{sessionId:'a'}).firestore(),b=env.authenticatedContext('u',{sessionId:'b'}).firestore(),other=env.authenticatedContext('v',{sessionId:'v'}).firestore();
- await assertSucceeds(getDoc(doc(a,'books','book')));await assertFails(getDoc(doc(other,'books','book')));await assertFails(updateDoc(doc(a,'users','u'),{'deviceSessions.a.revokedAt':null}));
+ await assertSucceeds(getDoc(doc(a,'books','book')));await assertFails(getDoc(doc(other,'books','book')));await assertFails(updateDoc(doc(a,'users','u'),{'deviceSessions.a.revokedAt':123}));
  await env.withSecurityRulesDisabled(ctx=>updateDoc(doc(ctx.firestore(),'users','u'),{'deviceSessions.a.revokedAt':Date.now()}));
  await assertFails(getDoc(doc(a,'books','book')));await assertFails(updateDoc(doc(a,'books','book'),{title:'Forbidden'}));await assertFails(getDoc(doc(a,'users','u')));await assertSucceeds(getDoc(doc(b,'books','book')));
  await assertFails(getDoc(doc(env.authenticatedContext('u').firestore(),'books','book')));
