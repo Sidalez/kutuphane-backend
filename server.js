@@ -2643,6 +2643,16 @@ const server = http.createServer((req, res) => withProcessing(async () => {
     // MEDYA - DETAY
     // ------------------------------------------------------------
 
+    if(req.method==='POST'&&pathname==='/api/media/series-schedule'){
+      const payload=await readBody(req);const id=Number(payload.tmdbId);
+      if(!Number.isSafeInteger(id)||id<=0)return json(res,400,{message:'Geçerli bir dizi kimliği gerekiyor.'});
+      const details=await tmdbRequest(`/tv/${id}`,{language:TMDB_LANGUAGE});
+      const numbers=[...new Set([details.last_episode_to_air?.season_number,details.next_episode_to_air?.season_number].filter(n=>Number.isInteger(n)&&n>0))];
+      const seasons=await Promise.all(numbers.map(n=>tmdbRequest(`/tv/${id}/season/${n}`,{language:TMDB_LANGUAGE})));
+      const episodes=seasons.flatMap(season=>(season.episodes||[]).map(e=>({seasonNumber:e.season_number,episodeNumber:e.episode_number,airDate:e.air_date||null})));
+      return json(res,200,{episodes,source:'TMDb'});
+    }
+
     if (req.method === "POST" && pathname === "/api/media/details") {
       const payload = await readBody(req);
 
