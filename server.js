@@ -2441,7 +2441,7 @@ Yalnızca şu JSON'u döndür:
   return { text, books: suggestedBooks, processing:processingInfo("book_recommendations") };
 }
 
-const notifications = require("./notifications").createNotificationService({ tmdbRequest, readBody, json, search: q => serperRequest("search", { q, gl: "tr", hl: "tr", num: 5 }) });
+const notifications = require("./notifications").createNotificationService({ tmdbRequest: rawTmdbRequest, readBody, json, search: q => serperRequest("search", { q, gl: "tr", hl: "tr", num: 5 }) });
 const deviceSessions=require('./deviceSessions').createDeviceSessionService({db:notifications.db,auth:notifications.auth,readBody,json});
 const server = http.createServer((req, res) => withProcessing(async () => {
   setCorsHeaders(res);

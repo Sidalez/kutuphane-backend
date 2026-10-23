@@ -1,3 +1,4 @@
+const {snapshotEpisodes,episodeChanges}=require('./tmdbEpisodeChanges');
 const { shouldResumeSeries } = require('./seriesStatus');
 const { loadOfficialTrailer } = require('./officialTrailers');
 const { upcomingEvent, filmRelease, trailerEvents } = require('./mediaNotifications');
@@ -175,6 +176,18 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
         // Establish a baseline on first follow; never notify years of historical episodes.
         const since = state?.since || today;
         const events = [];
+        // Record complete TMDb season contents, including future and undated episodes.
+        // Never replace a successful snapshot when any season request fails.
+        const episodeRecords=[];
+        for(const season of (details.seasons||[]).filter(s=>s.season_number>0)){
+          const data=await tmdbRequest(`/tv/${item.tmdbId}/season/${season.season_number}`,{language:'tr-TR'});
+          episodeRecords.push(...(data.episodes||[]));
+        }
+        for(const e of [details.last_episode_to_air,details.next_episode_to_air])if(e&&!episodeRecords.some(old=>old.season_number===e.season_number&&old.episode_number===e.episode_number))episodeRecords.push(e);
+        const episodeSnapshot=snapshotEpisodes(episodeRecords);
+        const changes=episodeChanges(item,state?.tmdbSnapshot,episodeSnapshot);
+        if(p.episodes)events.push(...changes.events);
+
         const latest = details.last_episode_to_air;
         if (shouldResumeSeries(item, latest, today)) {
           const resumed = await db.runTransaction(async tx => {
@@ -204,7 +217,7 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
             url: `/media/${encodeURIComponent(item.id)}`, airDate: next.air_date });
         }
         for (const event of events) await createEvent(uid, event);
-        await stateRef.set({ since: today, tmdbId: item.tmdbId, checkedAt: now.getTime() }, { merge: true });
+        await stateRef.set({ tmdbSnapshot:{episodes:episodeSnapshot,revisions:changes.revisions}, since: today, tmdbId: item.tmdbId, checkedAt: now.getTime() });
       } catch { console.warn("Bir dizinin yayın takvimi alınamadı; sonraki kontrolde yeniden denenecek."); }
     }
     // Removing a series also removes its cursor, so re-adding starts with a fresh baseline.
