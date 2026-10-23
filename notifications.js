@@ -168,6 +168,7 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
       try {
         const details = await tvDetails(Number(item.tmdbId));
         const metadata={};
+        if(details.verification)metadata.seriesVerification=details.verification;
         if(Number.isSafeInteger(details.number_of_episodes)&&details.number_of_episodes>=0&&details.number_of_episodes!==item.numberOfEpisodes)metadata.numberOfEpisodes=details.number_of_episodes;
         if(Number.isSafeInteger(details.number_of_seasons)&&details.number_of_seasons>=0&&details.number_of_seasons!==item.numberOfSeasons)metadata.numberOfSeasons=details.number_of_seasons;
         if(Object.keys(metadata).length)await db.runTransaction(async tx=>{const current=(await tx.get(doc.ref)).data();if(current?.userId===uid&&current.status!=='BIRAKILDI')tx.set(doc.ref,{...metadata,seriesSyncedAt:now.getTime()},{merge:true});});

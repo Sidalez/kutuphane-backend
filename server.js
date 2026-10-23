@@ -585,7 +585,8 @@ async function getTmdbFallbackData(endpoint, params) {
   }
 }
 
-async function tmdbRequest(endpoint, params = {}) {
+const tmdbRequest=require('./seriesVerification').createSeriesVerification(rawTmdbRequest);
+async function rawTmdbRequest(endpoint, params = {}) {
   if (!TMDB_ACCESS_TOKEN) {
     throw new Error("TMDB_ACCESS_TOKEN eksik. Backend .env dosyasını kontrol et.");
   }
@@ -2652,7 +2653,7 @@ const server = http.createServer((req, res) => withProcessing(async () => {
       const numbers=[...new Set([firstIncomplete,details.last_episode_to_air?.season_number,details.next_episode_to_air?.season_number].filter(n=>Number.isInteger(n)&&n>0))];
       const seasons=await Promise.all(numbers.map(n=>tmdbRequest(`/tv/${id}/season/${n}`,{language:TMDB_LANGUAGE})));
       const episodes=seasons.flatMap(season=>(season.episodes||[]).map(e=>({seasonNumber:e.season_number,episodeNumber:e.episode_number,airDate:e.air_date||null})));
-      return json(res,200,{episodes,source:'TMDb'});
+      return json(res,200,{episodes,source:'TMDb',verification:details.verification});
     }
 
     if (req.method === "POST" && pathname === "/api/media/details") {
