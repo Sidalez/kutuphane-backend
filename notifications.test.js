@@ -253,3 +253,10 @@ test('Failed season requests preserve last successful check and report an action
  async function request(path,body){const res={};await service.handle({method:body===undefined?'GET':'POST',headers:{authorization:'Bearer alice'},body},res,'/api/notifications'+path);return res;}
  try{await request('/preferences',{enabled:true,episodes:true,trailers:false,upcoming:false});await db.collection('mediaItems').doc('show').set({userId:'alice',tmdbId:42,type:'TV',title:'Dizi',status:'IZLENIYOR'});assert.equal((await request('/check',{})).status,502);const inbox=(await request('')).body;assert.equal(inbox.checkedAt,null);assert.match(inbox.lastCheckError,/1 dizi/);assert.ok(inbox.lastCheckAttemptAt);}finally{process.env=original;}
 });
+test('Scheduler health has no success claim before a run and records successful completion',async()=>{
+ const original={...process.env};process.env.FIREBASE_SERVICE_ACCOUNT_JSON='{}';process.env.NOTIFICATION_POLLING='false';const db=fakeFirestore();
+ const sdk={credential:{cert:()=>({})},initializeApp:()=>({firestore:()=>db,auth:()=>({})}),firestore:{FieldPath:{documentId:()=>'__name__'}}};
+ const service=createNotificationService({tmdbRequest:async()=>({}),readBody:async()=>({}),json:(res,status,body)=>Object.assign(res,{status,body})},{admin:sdk,webpush:{setVapidDetails(){}}});
+ async function health(){const res={};await service.handle({method:'GET',headers:{}},res,'/api/notifications/health');return res;}
+ try{assert.equal((await health()).body.status,'never_completed');await service.run();const result=await health();assert.equal(result.status,200);assert.equal(result.body.status,'healthy');assert.ok(result.body.lastSuccessAt);assert.equal(result.body.checked,undefined);}finally{process.env=original;}
+});
