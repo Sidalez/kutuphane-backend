@@ -449,12 +449,20 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
         for (const doc of page.docs) { try { await checkUser(doc.id); checked++; } catch { failed++; } }
         cursor = page.size === 100 ? page.docs.at(-1) : null;
       } while (cursor);
-      return { checked, failed };
+      const result={checked,failed};
+      await db.collection("_notificationJobs").doc("health").set({lastAttemptAt:Date.now(),...(failed===0?{lastSuccessAt:Date.now()}:{}),lastResult:result},{merge:true});
+      return result;
     } finally { if (claimed) await lock.set({ leaseUntil: 0 }); running = false; }
   }
   async function handle(req, res, pathname) {
     if (!pathname.startsWith("/api/notifications")) return false;
     try {
+      if(req.method==='GET'&&pathname==='/api/notifications/health'){
+        if(!ready){json(res,200,{ready:false,status:'not_configured'});return true;}
+        const data=(await db.collection('_notificationJobs').doc('health').get()).data()||{};
+        const age=data.lastSuccessAt?Date.now()-data.lastSuccessAt:null;
+        json(res,200,{ready:true,status:age===null?'never_completed':age>15*60000?'overdue':'healthy',lastSuccessAt:data.lastSuccessAt||null,lastAttemptAt:data.lastAttemptAt||null,pollingEnabled:process.env.NOTIFICATION_POLLING!=='false'});return true;
+      }
       if (req.method === "GET" && pathname === "/api/notifications/config") {
         json(res, 200, { ready, pushReady: ready && pushReady, publicKey: pushReady ? publicKey : null, seriesAutoResume: true, mediaDiscovery: true, personalizedReading: true, readingFollowUp: true, readingActivity: true }); return true;
       }

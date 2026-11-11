@@ -44,6 +44,8 @@ const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p";
 
 const PORT = process.env.PORT || 3001;
+const backendCommit=require('./backendVersion').backendVersion();
+const backendStartedAt=new Date().toISOString();
 
 const NO_PHOTO_URL =
   "https://cdn.vectorstock.com/i/500p/33/47/no-photo-available-icon-vector-40343347.jpg";
@@ -2494,6 +2496,7 @@ const server = http.createServer((req, res) => withProcessing(async () => {
       return json(res, 200, {
         success: true,
         message: "OK",
+        commit:backendCommit,startedAt:backendStartedAt,
       });
     }
 

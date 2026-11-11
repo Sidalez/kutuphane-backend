@@ -1,0 +1,1 @@
+const test=require('node:test'),assert=require('node:assert/strict');const {backendVersion}=require('./backendVersion');test('Health reports deployment commit without exposing environment values',()=>{assert.equal(backendVersion({RENDER_GIT_COMMIT:'123456789abcdef'}),'1234567');assert.equal(backendVersion({RENDER_GIT_COMMIT:'not-a-sha-secret'}),'unknown')});
