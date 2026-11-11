@@ -246,3 +246,10 @@ test('Scheduled check resumes completed series transactionally and respects drop
     assert.equal((await request('')).body.items.length,0); // Opting out of episode alerts does not prevent state synchronization.
   } finally {process.env=original;}
 });
+test('Failed season requests preserve last successful check and report an actionable failure',async()=>{
+ const original={...process.env};process.env.FIREBASE_SERVICE_ACCOUNT_JSON='{}';process.env.NOTIFICATION_POLLING='false';process.env.VAPID_PUBLIC_KEY='test-public';process.env.VAPID_PRIVATE_KEY='test-private';const db=fakeFirestore();
+ const sdk={credential:{cert:()=>({})},initializeApp:()=>({firestore:()=>db,auth:()=>({verifyIdToken:async()=>({uid:'alice'})})}),firestore:{FieldPath:{documentId:()=>'__name__'}}};
+ const service=createNotificationService({tmdbRequest:async path=>{if(path.includes('/season/'))throw Error('source down');return {seasons:[{season_number:1}]};},readBody:async req=>req.body,json:(res,status,body)=>Object.assign(res,{status,body})},{admin:sdk,webpush:{setVapidDetails(){}}});
+ async function request(path,body){const res={};await service.handle({method:body===undefined?'GET':'POST',headers:{authorization:'Bearer alice'},body},res,'/api/notifications'+path);return res;}
+ try{await request('/preferences',{enabled:true,episodes:true,trailers:false,upcoming:false});await db.collection('mediaItems').doc('show').set({userId:'alice',tmdbId:42,type:'TV',title:'Dizi',status:'IZLENIYOR'});assert.equal((await request('/check',{})).status,502);const inbox=(await request('')).body;assert.equal(inbox.checkedAt,null);assert.match(inbox.lastCheckError,/1 dizi/);assert.ok(inbox.lastCheckAttemptAt);}finally{process.env=original;}
+});

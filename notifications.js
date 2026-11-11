@@ -159,6 +159,7 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
     }
   }
   async function checkSeries(uid, p, now) {
+    let failures=0;
     const media = await db.collection("mediaItems").where("userId", "==", uid).get();
     const today = localClock(now, p.timeZone).date;
     for (const doc of media.docs) {
@@ -217,8 +218,12 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
             url: `/media/${encodeURIComponent(item.id)}`, airDate: next.air_date });
         }
         for (const event of events) await createEvent(uid, event);
-        await stateRef.set({ tmdbSnapshot:{episodes:episodeSnapshot,revisions:changes.revisions}, since: today, tmdbId: item.tmdbId, checkedAt: now.getTime() });
-      } catch { console.warn("Bir dizinin yayın takvimi alınamadı; sonraki kontrolde yeniden denenecek."); }
+        await stateRef.set({ lastError:null,lastAttemptAt:now.getTime(),tmdbSnapshot:{episodes:episodeSnapshot,revisions:changes.revisions}, since: today, tmdbId: item.tmdbId, checkedAt: now.getTime() });
+      } catch {
+        failures++;
+        await stateRef.set({lastAttemptAt:now.getTime(),lastError:'source_check_failed'},{merge:true});
+        console.warn("Bir dizinin yayın takvimi alınamadı; sonraki kontrolde yeniden denenecek.");
+      }
     }
     // Removing a series also removes its cursor, so re-adding starts with a fresh baseline.
     const states = await accounts().doc(uid).collection("series").get();
@@ -231,6 +236,7 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
         if (unfinished) await createEvent(uid, { id: `watching_${today}`, kind: "watching", title: "Kaldığın yerden devam et", body: `${unfinished.data().title} seni bekliyor.`, url: `/media/${encodeURIComponent(unfinished.id)}` });
       }
     }
+    return {failed:failures};
   }
   async function latestReadingSession(uid) {
     const books = await db.collection("books").where("userId", "==", uid).get();
@@ -410,16 +416,20 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
     if (!await claim(lock, 5 * 60000)) return;
     try {
       const now = new Date();
+      let seriesFailed=false;
       if (!a.readingCheckedAt || now.getTime() - a.readingCheckedAt >= 60000) {
         await checkReading(uid, a.preferences, now);
         await ref.set({ readingCheckedAt: now.getTime() }, { merge: true });
       }
       if (!a.checkedAt || now.getTime() - a.checkedAt >= 30 * 60000) {
-        await checkSeries(uid, a.preferences, now);
+        const seriesResult=await checkSeries(uid, a.preferences, now);
+        seriesFailed=seriesResult.failed>0;
+        if(seriesFailed)await ref.set({lastCheckAttemptAt:now.getTime(),lastCheckError:`${seriesResult.failed} dizi kontrol edilemedi.`},{merge:true});
         await checkMediaDiscovery(uid, a.preferences, now);
-        await ref.set({ checkedAt: now.getTime() }, { merge: true });
+        if(!seriesFailed)await ref.set({ checkedAt: now.getTime(),lastCheckAttemptAt:now.getTime(),lastCheckError:null }, { merge: true });
       }
       await deliver(uid, a.preferences, now);
+      if(seriesFailed)throw fail(502,"Bazı dizilerin kaynak kontrolü tamamlanamadı. Yeniden denenecek.");
     } finally { await lock.set({ leaseUntil: 0 }, { merge: true }); }
   }
   let running = false;
@@ -467,7 +477,7 @@ function createNotificationService({ tmdbRequest, readBody, json, search }, depe
         const a = await account(uid);
         const list = await inbox(uid).orderBy("createdAt", "desc").limit(100).get();
         const devices = await subscriptions(uid).get();
-        json(res, 200, { preferences: a.preferences, checkedAt: a.checkedAt || null, deviceCount: devices.size, items: list.docs.filter(d => !d.data().deleted && d.data().createdAt > (a.inboxClearedAt || 0)).map(d => ({ id: d.id, ...d.data() })) }); return true;
+        json(res, 200, { preferences: a.preferences, checkedAt: a.checkedAt || null,lastCheckAttemptAt:a.lastCheckAttemptAt||null,lastCheckError:a.lastCheckError||null, deviceCount: devices.size, items: list.docs.filter(d => !d.data().deleted && d.data().createdAt > (a.inboxClearedAt || 0)).map(d => ({ id: d.id, ...d.data() })) }); return true;
       }
       const body = req.method === "POST" ? await readBody(req) : {};
       if (req.method === "POST" && pathname === "/api/notifications/clear") {
